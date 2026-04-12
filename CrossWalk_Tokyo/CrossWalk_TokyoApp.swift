@@ -9,32 +9,34 @@ import SwiftUI
 
 @main
 struct CrossWalk_TokyoApp: App {
-    
+
     @State private var appModel = AppModel()
-    @State private var avPlayerViewModel = AVPlayerViewModel()
-    
+    @State private var bodyModel = BodyTrackingModel()
+
     var body: some Scene {
         WindowGroup {
-            if avPlayerViewModel.isPlaying {
-                AVPlayerView(viewModel: avPlayerViewModel)
-            } else {
-                ContentView()
-                    .environment(appModel)
-            }
+            ContentView()
+                .environment(appModel)
         }
-        
+
         ImmersiveSpace(id: appModel.immersiveSpaceID) {
             ImmersiveView()
                 .environment(appModel)
+                .environment(bodyModel)
                 .onAppear {
                     appModel.immersiveSpaceState = .open
-                    avPlayerViewModel.play()
                 }
                 .onDisappear {
                     appModel.immersiveSpaceState = .closed
-                    avPlayerViewModel.reset()
                 }
         }
         .immersionStyle(selection: .constant(.full), in: .full)
+
+        // Calibration control panel (separate window)
+        WindowGroup(id: "calibrationPanel") {
+            CalibrationControlPanel()
+                .environment(bodyModel)
+        }
+        .windowStyle(.plain)
     }
 }
