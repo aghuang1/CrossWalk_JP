@@ -158,6 +158,31 @@ struct ControlOverlayPanel: View {
                     SectionHeader("Shank")
                     StepperRow(label: "Length", value: $model.shankLength, step: 0.01)
                     StepperRow(label: "Radius", value: $model.shankRadius, step: 0.01)
+
+                    Divider().background(.white.opacity(0.3))
+
+                    SectionHeader("Activation Trigger")
+                    StepperRow(label: "Width", value: $model.activationTriggerWidth, step: 0.1)
+                    StepperRow(label: "Height", value: $model.activationTriggerHeight, step: 0.1)
+                    StepperRow(label: "Depth", value: $model.activationTriggerDepth, step: 0.1)
+
+                    Divider().background(.white.opacity(0.3))
+
+                    SectionHeader("Upper Arm Trigger")
+                    StepperRow(label: "Height", value: $model.upperArmTriggerHeight, step: 0.02)
+                    StepperRow(label: "Lateral", value: $model.upperArmTriggerLateral, step: 0.05)
+
+                    SectionHeader("Forearm Trigger")
+                    StepperRow(label: "Height", value: $model.forearmTriggerHeight, step: 0.02)
+                    StepperRow(label: "Lateral", value: $model.forearmTriggerLateral, step: 0.05)
+
+                    SectionHeader("Thigh Trigger")
+                    StepperRow(label: "Height", value: $model.thighTriggerHeight, step: 0.02)
+                    StepperRow(label: "Lateral", value: $model.thighTriggerLateral, step: 0.05)
+
+                    SectionHeader("Shank Trigger")
+                    StepperRow(label: "Height", value: $model.shankTriggerHeight, step: 0.02)
+                    StepperRow(label: "Lateral", value: $model.shankTriggerLateral, step: 0.05)
                 }
             }
             .frame(maxHeight: 500)

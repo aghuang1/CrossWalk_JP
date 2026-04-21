@@ -3,10 +3,13 @@
  CrossWalk_Tokyo
 
  Central orchestrator for body limb tracking, IMU calibration, collision detection,
- and haptic motor control. Adapted from ExtendedTouch_AVP's EntityModel.swift.
+ and haptic motor control. Ported from ExtendedTouch_AVP's EntityModel.swift
+ (isotropicExpansion branch).
 
- Removed: SceneReconstructionManager, PlaneDetectionManager dependencies.
- Modified: checkActivationByDistance uses obstacle entity proximity instead of mesh proximity.
+ CrossWalk-specific differences vs. ExtendedTouch:
+ - Uses IMUUDPClient instead of UDPClient (compatible API).
+ - No SceneReconstructionManager / PlaneDetectionManager (no mesh scanning).
+ - No floor-collision filtering or hand-level haptic state machine.
 */
 
 import ARKit
@@ -59,14 +62,6 @@ let imuClient = IMUUDPClient(
 @Observable
 @MainActor
 class BodyTrackingModel {
-    // Pre-computed segment order for dead reckoning (parents first, then children)
-    private static let orderedSegmentPairs: [(String, HandTrackingManager.IMUBodySegment)] = [
-        ("leftUpperArm",  .leftUpperArm),  ("rightUpperArm", .rightUpperArm),
-        ("leftThigh",     .leftThigh),     ("rightThigh",    .rightThigh),
-        ("leftForearm",   .leftForearm),   ("rightForearm",  .rightForearm),
-        ("leftShank",     .leftShank),     ("rightShank",    .rightShank),
-    ]
-
     let session = ARKitSession()
     let worldTracking = WorldTrackingProvider()
     let handManager = HandTrackingManager()
@@ -77,20 +72,25 @@ class BodyTrackingModel {
     private var hasAttachedToScene = false
     private var lastHeadsetTransform: simd_float4x4?
 
-    // References to obstacle entities for distance-based activation
-    var obstacleEntities: [Entity] = []
-
     // Combine subscriptions
     nonisolated(unsafe) private var orientationSubscription: AnyCancellable?
     nonisolated(unsafe) private var collisionBeganSubscription: (any Cancellable)?
     nonisolated(unsafe) private var collisionEndedSubscription: (any Cancellable)?
     nonisolated(unsafe) private var skeletonTrackingSubscription: (any Cancellable)?
 
-    // MARK: - Collision State (per-motor collision tracking)
+    // MARK: - Collision State (per-segment, per-level collision tracking)
 
-    private var motorCollisionCounts: [String: Int] = {
-        var d: [String: Int] = [:]
-        for seg in activeSegments { d[seg] = 0 }
+    // Collision counts per motor segment per level: [segment: ["far": N, "med": N]]
+    private var motorLevelCollisionCounts: [String: [String: Int]] = {
+        var d: [String: [String: Int]] = [:]
+        for seg in activeSegments { d[seg] = ["far": 0, "med": 0] }
+        return d
+    }()
+
+    // Current motor command per segment (nil = OFF)
+    private var motorCurrentLevel: [String: String?] = {
+        var d: [String: String?] = [:]
+        for seg in activeSegments { d[seg] = nil }
         return d
     }()
 
@@ -100,17 +100,33 @@ class BodyTrackingModel {
         return d
     }()
 
+    /// Returns the deepest active level for a segment ("med" > "far"), or nil if none active.
+    private func deepestActiveLevel(for segment: String) -> String? {
+        guard let levels = motorLevelCollisionCounts[segment] else { return nil }
+        if (levels["med"] ?? 0) > 0 { return "med" }
+        if (levels["far"] ?? 0) > 0 { return "far" }
+        return nil
+    }
+
     nonisolated(unsafe) private var motorOffDebounceTimers: [String: Timer] = [:]
     private let motorOffDebounceDelay: TimeInterval = 1.0
 
     private var lastSentCommand: [String: String] = [:]
 
-    var areSkeletonsActive: Bool = false
+    // Upper/lower limb activation (independent — controlled by headset trigger volumes)
+    var areUpperLimbsActive: Bool = false
+    var areLowerLimbsActive: Bool = false
+    private var upperActivationCollisionCount: Int = 0
+    private var lowerActivationCollisionCount: Int = 0
+
+    // Headset activation trigger volume entities (box prisms that follow headset)
+    private var upperActivationTrigger: Entity?
+    private var lowerActivationTrigger: Entity?
+    var activationTriggerWidth: Float = 2.0 { didSet { geometryNeedsRefresh = true } }
+    var activationTriggerHeight: Float = 1.0 { didSet { geometryNeedsRefresh = true } }
+    var activationTriggerDepth: Float = 2.0 { didSet { geometryNeedsRefresh = true } }
 
     private var imuStreamingSegments: Set<String> = []
-
-    private var activationFrameCounter: Int = 0
-    private let activationRadius: Float = 1.5
 
     let shellMotorLabels: [String] = ["CLOSE", "MED", "FAR"]
 
@@ -143,19 +159,43 @@ class BodyTrackingModel {
     var hipVerticalOffset: Float = -0.70
     var hipLateralOffset: Float = 0.10
 
-    var skeletonRadius: Float = 1.0
-    var skeletonAngles: [Float] = [0, -Float.pi/3, Float.pi/3]
+    // Superimposed skeleton: zero radius, single angle (facing forward).
+    var skeletonRadius: Float = 0.0
+    var skeletonAngles: [Float] = [0]
 
-    var upperArmLength: Float = 0.28
-    var upperArmRadius: Float = 0.08
-    var forearmLength: Float = 0.25
-    var forearmRadius: Float = 0.08
-    var thighLength: Float = 0.45
-    var thighRadius: Float = 0.10
-    var shankLength: Float = 0.17
-    var shankRadius: Float = 0.10
+    // Dirty flag: set true when any dimension changes; checked in frame loop.
+    var geometryNeedsRefresh: Bool = false
 
-    // MARK: - IMU Calibration (Two-Pose Gram-Schmidt)
+    var upperArmLength: Float = 0.28 { didSet { geometryNeedsRefresh = true } }
+    var upperArmRadius: Float = 0.08 { didSet { geometryNeedsRefresh = true } }
+    var forearmLength: Float = 0.25 { didSet { geometryNeedsRefresh = true } }
+    var forearmRadius: Float = 0.08 { didSet { geometryNeedsRefresh = true } }
+    var thighLength: Float = 0.45 { didSet { geometryNeedsRefresh = true } }
+    var thighRadius: Float = 0.10 { didSet { geometryNeedsRefresh = true } }
+    var shankLength: Float = 0.17 { didSet { geometryNeedsRefresh = true } }
+    var shankRadius: Float = 0.10 { didSet { geometryNeedsRefresh = true } }
+
+    var upperArmTriggerHeight: Float = 0.28 { didSet { geometryNeedsRefresh = true } }
+    var upperArmTriggerLateral: Float = 0.50 { didSet { geometryNeedsRefresh = true } }
+    var forearmTriggerHeight: Float = 0.25 { didSet { geometryNeedsRefresh = true } }
+    var forearmTriggerLateral: Float = 0.50 { didSet { geometryNeedsRefresh = true } }
+    var thighTriggerHeight: Float = 0.45 { didSet { geometryNeedsRefresh = true } }
+    var thighTriggerLateral: Float = 0.50 { didSet { geometryNeedsRefresh = true } }
+    var shankTriggerHeight: Float = 0.17 { didSet { geometryNeedsRefresh = true } }
+    var shankTriggerLateral: Float = 0.50 { didSet { geometryNeedsRefresh = true } }
+
+    // MARK: - IMU Calibration (Two-Pose, SlimeVR-style left/right split)
+    //
+    // Pose 1: STANDING — all limbs hanging straight down.
+    // Pose 2: SITTING with arms forward — thighs parallel to ground,
+    //         arms extended straight forward (parallel to ground).
+    //
+    // Per sensor we produce TWO corrections:
+    //   leftFix  — world-frame rotation (ENU→AVP basis + yaw alignment). Left-multiplied on raw.
+    //   rightFix — body-frame rotation (preRotation · axialFix). Right-multiplied on raw.
+    //
+    // Runtime formula (per sensor i):
+    //   q_calibrated^(i) = leftFix^(i) · raw^(i) · rightFix^(i)
 
     enum CalibrationState {
         case notCalibrated
@@ -168,8 +208,29 @@ class BodyTrackingModel {
     private var calibrationState: CalibrationState = .notCalibrated
     private var pose1IMUData: [String: simd_quatf] = [:]
     private var pose2IMUData: [String: simd_quatf] = [:]
-    private var imuCalibrationOffsets: [String: simd_quatf] = [:]
+    private var imuLeftFix:  [String: simd_quatf] = [:]
+    private var imuRightFix: [String: simd_quatf] = [:]
     private var imuLimbDownAxis: [String: SIMD3<Float>] = [:]
+
+    // Yaw-drift auto-compensation on STOP→START cycles. BNO086 re-anchors its yaw
+    // reference on stream restart, which invalidates the per-sensor leftFix solved
+    // at calibration time. Snapshot each limb's raw before STOP; on first packet
+    // after START, fold inverse-drift into leftFix.
+    private var rawBeforeStop: [String: simd_quatf] = [:]
+    private var pendingYawResync: Set<String> = []
+
+    // Last raw quaternion dispatched per segment. Suppresses re-processing of stale
+    // segments when UDP delivers one segment per packet — otherwise an upper-arm
+    // packet refreshes lastParentOrientations and then the forearm is re-dispatched
+    // with a time-mismatched (fresh parent, stale child) pair.
+    private var lastDispatchedRaw: [String: simd_quatf] = [:]
+
+    // Single-fire latch: snapshot+stop runs at most once per inactive period.
+    private var hasStoppedLimbsThisSession: Bool = false
+    private let limbStopDebounceSeconds: UInt64 = 2
+    private var pendingLimbStopTask: Task<Void, Never>?
+
+    private var lastQuatLogTime: [String: CFTimeInterval] = [:]
     private var lastIMUOrientations: [String: simd_quatf] = [:]
     private var calibrationHeadsetYaw: Float = 0.0
     private var calibrationHeadingQ: simd_quatf = simd_quatf(ix: 0, iy: 0, iz: 0, r: 1)
@@ -185,23 +246,18 @@ class BodyTrackingModel {
         return calibrationState == .calibrated
     }
 
-    // Dead reckoning state
-    private struct DeadReckoningState {
-        var packetQuat: simd_quatf = simd_quatf(ix: 0, iy: 0, iz: 0, r: 1)
-        var angularVelocity: SIMD3<Float> = .zero
-        var packetTime: CFTimeInterval = 0
-        var displayQuat: simd_quatf = simd_quatf(ix: 0, iy: 0, iz: 0, r: 1)
-        var hasReceivedPacket: Bool = false
-    }
-    private var drState: [String: DeadReckoningState] = [:]
-    private var lastDRFrameTime: CFTimeInterval = 0
-    private let drCorrectionBlend: Float = 0.1
-
     // Chest yaw smoothing
     private var chestYawTarget: simd_quatf = simd_quatf(ix: 0, iy: 0, iz: 0, r: 1)
     private var chestYawDisplay: simd_quatf = simd_quatf(ix: 0, iy: 0, iz: 0, r: 1)
     private var hasChestYawTarget: Bool = false
     private let chestYawBlend: Float = 0.15
+
+    // Chest yaw reference captured from the first post-calibration chest packet.
+    // chestYawDelta is measured relative to THIS — not to calibrationHeadingQ —
+    // so any residual chest-solve mismatch cancels out and the skeleton starts
+    // aligned with calibrationHeadingQ regardless of chest-solve Gram-Schmidt fit.
+    private var chestYawReference: simd_quatf = simd_quatf(ix: 0, iy: 0, iz: 0, r: 1)
+    private var hasChestYawReference: Bool = false
 
     // MARK: - Setup
 
@@ -221,7 +277,31 @@ class BodyTrackingModel {
 
         setupIMUOrientationSubscription()
 
+        // All limbs start hidden; shown when activation triggers fire or calibration starts.
         handManager.setAllLimbsActive(false)
+
+        // Create headset activation trigger volumes (upper + lower body).
+        let boxShape = ShapeResource.generateBox(
+            width: activationTriggerWidth,
+            height: activationTriggerHeight,
+            depth: activationTriggerDepth
+        )
+
+        let upper = TriggerVolume(shape: boxShape)
+        upper.name = "headsetActivationTrigger_upper"
+        var upperCollision = upper.collision ?? CollisionComponent(shapes: [boxShape])
+        upperCollision.filter = CollisionFilter(group: .skeleton, mask: .obstacle)
+        upper.components.set(upperCollision)
+        contentEntity.addChild(upper)
+        upperActivationTrigger = upper
+
+        let lower = TriggerVolume(shape: boxShape)
+        lower.name = "headsetActivationTrigger_lower"
+        var lowerCollision = lower.collision ?? CollisionComponent(shapes: [boxShape])
+        lowerCollision.filter = CollisionFilter(group: .skeleton, mask: .obstacle)
+        lower.components.set(lowerCollision)
+        contentEntity.addChild(lower)
+        lowerActivationTrigger = lower
 
         return contentEntity
     }
@@ -239,13 +319,11 @@ class BodyTrackingModel {
             self?.handleCollisionEnded(event)
         }
 
-        // Update skeleton positions + dead reckoning every render frame (90Hz)
+        // Update skeleton positions every render frame (90Hz on Vision Pro)
         skeletonTrackingSubscription = scene.subscribe(to: SceneEvents.Update.self) { [weak self] _ in
             guard let self = self else { return }
 
             let now = CACurrentMediaTime()
-            let frameDt = self.lastDRFrameTime > 0 ? Float(now - self.lastDRFrameTime) : 0
-            self.lastDRFrameTime = now
 
             if let deviceAnchor = self.worldTracking.queryDeviceAnchor(atTimestamp: now) {
                 let cameraTransform = deviceAnchor.originFromAnchorTransform
@@ -260,13 +338,37 @@ class BodyTrackingModel {
                     hipLateralOffset: self.hipLateralOffset
                 )
 
-                self.activationFrameCounter += 1
-                if self.isIMUCalibrated && self.activationFrameCounter % 10 == 0 {
-                    self.checkActivationByDistance(headsetTransform: cameraTransform)
+                // Move activation triggers to follow the headset, yaw-only orientation.
+                let headPos = SIMD3<Float>(cameraTransform.columns.3.x, cameraTransform.columns.3.y, cameraTransform.columns.3.z)
+                self.upperActivationTrigger?.position = headPos + SIMD3<Float>(0, self.shoulderVerticalOffset, 0)
+                self.lowerActivationTrigger?.position = headPos + SIMD3<Float>(0, self.hipVerticalOffset, 0)
+                let fullQ = simd_quatf(cameraTransform)
+                let fwd = simd_act(fullQ, SIMD3<Float>(0, 0, -1))
+                let yaw = atan2(fwd.x, fwd.z)
+                let yawOnlyQ = simd_quatf(angle: yaw, axis: SIMD3<Float>(0, 1, 0))
+                self.upperActivationTrigger?.orientation = yawOnlyQ
+                self.lowerActivationTrigger?.orientation = yawOnlyQ
+
+                // Keep segment trigger volumes world-axis-aligned.
+                self.handManager.resetTriggerOrientations()
+
+                if self.geometryNeedsRefresh {
+                    self.geometryNeedsRefresh = false
+                    self.handManager.refreshGeometry(
+                        upperArmLength: self.upperArmLength, upperArmRadius: self.upperArmRadius,
+                        forearmLength: self.forearmLength, forearmRadius: self.forearmRadius,
+                        thighLength: self.thighLength, thighRadius: self.thighRadius,
+                        shankLength: self.shankLength, shankRadius: self.shankRadius,
+                        uaTrigH: self.upperArmTriggerHeight, uaTrigLat: self.upperArmTriggerLateral,
+                        faTrigH: self.forearmTriggerHeight, faTrigLat: self.forearmTriggerLateral,
+                        thTrigH: self.thighTriggerHeight, thTrigLat: self.thighTriggerLateral,
+                        shTrigH: self.shankTriggerHeight, shTrigLat: self.shankTriggerLateral
+                    )
+                    self.refreshActivationTriggers()
                 }
             }
 
-            // Chest yaw: SLERP toward target each frame
+            // Chest yaw: SLERP toward target each frame for smooth rotation.
             if self.hasChestYawTarget {
                 var target = self.chestYawTarget
                 if simd_dot(self.chestYawDisplay.vector, target.vector) < 0 {
@@ -276,30 +378,6 @@ class BodyTrackingModel {
                 self.chestYawDisplay = simd_slerp(self.chestYawDisplay, target, self.chestYawBlend)
                 self.handManager.chestYawDelta = self.chestYawDisplay
                 self.handManager.chestYawDeltaInverse = self.chestYawDisplay.inverse
-            }
-
-            // Dead reckoning: interpolate limb orientations at 90Hz
-            guard frameDt > 0 && frameDt < 0.1 else { return }
-
-            for (segmentName, segment) in Self.orderedSegmentPairs {
-                guard var state = self.drState[segmentName], state.hasReceivedPacket else { continue }
-
-                state.displayQuat = self.quatIntegrate(state.displayQuat, omega: state.angularVelocity, dt: frameDt)
-
-                let elapsed = Float(now - state.packetTime)
-                var target = state.packetQuat
-                if elapsed > 0 && elapsed < 1.0 {
-                    target = self.quatIntegrate(state.packetQuat, omega: state.angularVelocity, dt: elapsed)
-                }
-
-                if simd_dot(state.displayQuat.vector, target.vector) < 0 {
-                    target = simd_quatf(ix: -target.imag.x, iy: -target.imag.y,
-                                        iz: -target.imag.z, r: -target.real)
-                }
-                state.displayQuat = simd_slerp(state.displayQuat, target, self.drCorrectionBlend)
-
-                self.drState[segmentName] = state
-                self.handManager.updateIMUCylinderOrientation(segment: segment, orientation: state.displayQuat)
             }
         }
     }
@@ -318,16 +396,27 @@ class BodyTrackingModel {
                     print("[IMU] receiving \(orientations.count) segment(s)")
                 }
 
+                // Cache latest raw orientations and run yaw-resync on first packet after restart.
                 for (nodeID, quat) in orientations {
                     if let segName = nodeIDToSegment[nodeID] {
+                        if let prev = self.lastIMUOrientations[segName] {
+                            let dot = abs(prev.real * quat.real + prev.imag.x * quat.imag.x + prev.imag.y * quat.imag.y + prev.imag.z * quat.imag.z)
+                            let angleDeg = 2 * acos(min(dot, 1.0)) * 180 / .pi
+                            if angleDeg > 10 {
+                                print("[\(segName)] raw jump \(String(format: "%.1f", angleDeg))°")
+                            }
+                        }
+                        if self.isIMUCalibrated {
+                            self.applyYawResyncIfNeeded(segment: segName, currentRaw: quat)
+                        }
                         self.lastIMUOrientations[segName] = quat
                     }
                 }
 
-                // Auto-start calibration when first IMU data arrives
+                // Auto-start calibration when first IMU data arrives.
                 if !self.autoCalibrationScheduled && self.calibrationState == .notCalibrated && !orientations.isEmpty {
                     self.autoCalibrationScheduled = true
-                    print("IMU data received! Starting calibration in 3 seconds...")
+                    print("IMU data received. Starting calibration in 3 seconds...")
 
                     self.calibrationStatusTitle = "IMUs Connected"
                     self.calibrationStatusDetail = "Starting calibration. Prepare pose 1: stand still with arms down."
@@ -341,33 +430,45 @@ class BodyTrackingModel {
                     }
                 }
 
-                // Dispatch calibrated orientations to active segments
-                for (nodeID, rawQuat) in orientations {
-                    guard let segmentName = nodeIDToSegment[nodeID] else { continue }
+                // Dispatch calibrated orientations to active segments.
+                // Two-pass: parents first so lastParentOrientations is fresh before children.
+                guard self.isIMUCalibrated else { return }
 
-                    if segmentName == chestSegment {
-                        guard self.isIMUCalibrated else { continue }
+                let parentSegments: Set<String> = ["leftUpperArm", "rightUpperArm", "leftThigh", "rightThigh"]
+
+                for pass in 0..<2 {
+                    for (nodeID, rawQuat) in orientations {
+                        guard let segmentName = nodeIDToSegment[nodeID] else { continue }
+                        let isParent = parentSegments.contains(segmentName)
+                        if pass == 0 && !isParent && segmentName != chestSegment { continue }
+                        if pass == 1 && (isParent || segmentName == chestSegment) { continue }
+
+                        // Skip stale segments.
+                        if let prev = self.lastDispatchedRaw[segmentName],
+                           prev.vector == rawQuat.vector {
+                            continue
+                        }
+                        self.lastDispatchedRaw[segmentName] = rawQuat
+
+                        // Chest: extract yaw for skeleton rotation only.
+                        if segmentName == chestSegment {
+                            let calibrated = self.applyIMUCalibration(segment: segmentName, raw: rawQuat)
+                            self.updateChestYaw(calibrated: calibrated)
+                            continue
+                        }
+
                         let calibrated = self.applyIMUCalibration(segment: segmentName, raw: rawQuat)
-                        self.updateChestYaw(calibrated: calibrated)
-                        continue
-                    }
+                        self.logSegmentIfDue(segment: segmentName, raw: rawQuat, calibrated: calibrated)
 
-                    guard self.isIMUCalibrated else { continue }
-                    let calibrated = self.applyIMUCalibration(segment: segmentName, raw: rawQuat)
-                    let angVels = imuClient.angularVelocities
-                    let pktTimes = imuClient.packetTimestamps
-                    let omega = angVels[nodeID] ?? .zero
-                    let pktTime = pktTimes[nodeID] ?? CACurrentMediaTime()
+                        // Update parent orientation before children use it.
+                        if isParent, let imuSeg = HandTrackingManager.IMUBodySegment(rawValue: segmentName) {
+                            self.handManager.updateParentOrientation(segment: imuSeg, orientation: calibrated)
+                        }
 
-                    var state = self.drState[segmentName] ?? DeadReckoningState()
-                    state.packetQuat = calibrated
-                    state.angularVelocity = omega
-                    state.packetTime = pktTime
-                    if !state.hasReceivedPacket {
-                        state.displayQuat = calibrated
-                        state.hasReceivedPacket = true
+                        if let imuSeg = HandTrackingManager.IMUBodySegment(rawValue: segmentName) {
+                            self.handManager.updateIMUCylinderOrientation(segment: imuSeg, orientation: calibrated)
+                        }
                     }
-                    self.drState[segmentName] = state
                 }
             }
     }
@@ -403,9 +504,12 @@ class BodyTrackingModel {
     }
 
     func startCalibration() {
+        // Full state reset first.
         resetIMUCalibration()
 
         print("IMU CALIBRATION (Two-Pose Gram-Schmidt)")
+        print("POSE 1 - STANDING: all limbs hanging straight down")
+        print("POSE 2 - SITTING with arms + shanks extended forward")
 
         updateCalibrationStatus(
             title: "Calibration: Pose 1",
@@ -426,17 +530,30 @@ class BodyTrackingModel {
     private func capturePose1() {
         guard calibrationState == .waitingForPose1 else { return }
 
-        if let deviceAnchor = worldTracking.queryDeviceAnchor(atTimestamp: CACurrentMediaTime()) {
-            let headsetTransform = deviceAnchor.originFromAnchorTransform
-            let headsetForward = SIMD3<Float>(
-                -headsetTransform.columns.2.x, 0, -headsetTransform.columns.2.z
+        // Prefer the scene-loop-cached transform (refreshed every frame).
+        // queryDeviceAnchor can sporadically return nil even when tracking is healthy,
+        // which caused spurious "Headset tracking not ready" on re-calibration.
+        let headsetTransform: simd_float4x4
+        if let cached = lastHeadsetTransform {
+            headsetTransform = cached
+        } else if let deviceAnchor = worldTracking.queryDeviceAnchor(atTimestamp: CACurrentMediaTime()) {
+            headsetTransform = deviceAnchor.originFromAnchorTransform
+        } else {
+            updateCalibrationStatus(
+                title: "Calibration Failed",
+                detail: "Headset tracking not ready. Please wait and try again."
             )
-            let headsetForwardNormalized = simd_normalize(headsetForward)
-            calibrationHeadsetForwardAVP = headsetForwardNormalized
-            calibrationHeadsetYaw = atan2(headsetForwardNormalized.x, -headsetForwardNormalized.z)
-            calibrationHeadingQ = simd_quatf(angle: -calibrationHeadsetYaw, axis: SIMD3<Float>(0, 1, 0))
-            handManager.calibrationHeadingQ = calibrationHeadingQ
+            calibrationState = .notCalibrated
+            return
         }
+        let headsetForward = SIMD3<Float>(
+            -headsetTransform.columns.2.x, 0, -headsetTransform.columns.2.z
+        )
+        let headsetForwardNormalized = simd_normalize(headsetForward)
+        calibrationHeadsetForwardAVP = headsetForwardNormalized
+        calibrationHeadsetYaw = atan2(headsetForwardNormalized.x, -headsetForwardNormalized.z)
+        calibrationHeadingQ = simd_quatf(angle: -calibrationHeadsetYaw, axis: SIMD3<Float>(0, 1, 0))
+        handManager.calibrationHeadingQ = calibrationHeadingQ
 
         var capturedCount = 0
         for segment in activeSegments {
@@ -488,118 +605,37 @@ class BodyTrackingModel {
         computeCalibration()
     }
 
+    /// Computes per-sensor leftFix + rightFix from the two captured poses.
+    /// Limb segments: leftFix via Gram-Schmidt (pose1/pose2 world-frame basis → canonical AVP).
+    /// rightFix = preRotation · axialFix (cylinder axis → sensor axis, then axial residual).
+    /// Chest: leftFix from detected gravity + forward axes; rightFix = identity.
     private func computeCalibration() {
         var calibratedCount = 0
 
-        let armSegmentList   = activeSegments.filter { !legSegments.contains($0) && $0 != chestSegment }
-        let thighSegmentList = activeSegments.filter { thighSegments.contains($0) }
-        let shankSegmentList = activeSegments.filter { shankSegments.contains($0) }
+        let limbSegmentList = activeSegments.filter { $0 != chestSegment }
 
-        // Phase 1: Arms
-        for segment in armSegmentList {
-            guard let pose1 = pose1IMUData[segment], let pose2 = pose2IMUData[segment] else { continue }
+        let yawQ = simd_quatf(angle: -calibrationHeadsetYaw, axis: SIMD3<Float>(0, 1, 0))
+        let target_down_p1   = rotateVector(SIMD3<Float>(0, -1, 0), by: yawQ)
+        let target_fwd_p1    = rotateVector(SIMD3<Float>(0,  0, -1), by: yawQ)
+        let target_normal_p1 = simd_normalize(simd_cross(target_down_p1, target_fwd_p1))
+        let target_up_p2     = SIMD3<Float>(0, 1, 0)
 
-            let limbDownLocal = SIMD3<Float>(0, -1, 0)
-            imuLimbDownAxis[segment] = limbDownLocal
-
-            let limbDown1 = rotateVector(limbDownLocal, by: pose1)
-            let e_down = simd_normalize(limbDown1)
-            let limbDown2 = rotateVector(limbDownLocal, by: pose2)
-
-            let proj = simd_dot(limbDown2, e_down) * e_down
-            let swingRaw = limbDown2 - proj
-            guard simd_length(swingRaw) > 0.01 else { continue }
-            let e_swing = simd_normalize(swingRaw)
-            let e_normal = simd_normalize(simd_cross(e_down, e_swing))
-
-            let t_down = SIMD3<Float>(0, -1, 0)
-            let t_fwd = SIMD3<Float>(0, 0, -1)
-            let t_normal = simd_normalize(simd_cross(t_down, t_fwd))
-            let yawQ = simd_quatf(angle: -calibrationHeadsetYaw, axis: SIMD3<Float>(0, 1, 0))
-            let target_down   = rotateVector(t_down, by: yawQ)
-            let target_fwd    = rotateVector(t_fwd, by: yawQ)
-            let target_normal = rotateVector(t_normal, by: yawQ)
-
-            let M_src = simd_float3x3(columns: (e_normal, e_down, e_swing))
-            let M_tgt = simd_float3x3(columns: (target_normal, target_down, target_fwd))
-            let R = M_tgt * M_src.transpose
-
-            imuCalibrationOffsets[segment] = simd_quatf(R)
-            calibratedCount += 1
+        // Auto-detect limb-down axis for every limb segment (arms + legs).
+        for segment in limbSegmentList {
+            if solveLimbCorrection(segment: segment,
+                                   useAutoDetectedLimbAxis: true,
+                                   target_down: target_down_p1,
+                                   target_fwd:  target_fwd_p1,
+                                   target_normal: target_normal_p1,
+                                   target_up_pose2: target_up_p2) {
+                calibratedCount += 1
+            }
         }
 
-        // Phase 2: Thighs
-        for segment in thighSegmentList {
-            guard let pose1 = pose1IMUData[segment], let pose2 = pose2IMUData[segment] else { continue }
-
-            let enuDown = SIMD3<Float>(0, 0, -1)
-            let limbDownLocal = simd_normalize(rotateVector(enuDown, by: pose1.inverse))
-            imuLimbDownAxis[segment] = limbDownLocal
-
-            let limbDown1 = rotateVector(limbDownLocal, by: pose1)
-            let e_down = simd_normalize(limbDown1)
-            let limbDown2 = rotateVector(limbDownLocal, by: pose2)
-
-            let proj = simd_dot(limbDown2, e_down) * e_down
-            let swingRaw = limbDown2 - proj
-            guard simd_length(swingRaw) > 0.01 else { continue }
-            let e_swing = simd_normalize(swingRaw)
-            let e_normal = simd_normalize(simd_cross(e_down, e_swing))
-
-            let t_down = SIMD3<Float>(0, -1, 0)
-            let t_fwd = SIMD3<Float>(0, 0, -1)
-            let t_normal = simd_normalize(simd_cross(t_down, t_fwd))
-            let yawQ = simd_quatf(angle: -calibrationHeadsetYaw, axis: SIMD3<Float>(0, 1, 0))
-            let target_down   = rotateVector(t_down, by: yawQ)
-            let target_fwd    = rotateVector(t_fwd, by: yawQ)
-            let target_normal = rotateVector(t_normal, by: yawQ)
-
-            let M_src = simd_float3x3(columns: (e_normal, e_down, e_swing))
-            let M_tgt = simd_float3x3(columns: (target_normal, target_down, target_fwd))
-            let R = M_tgt * M_src.transpose
-
-            imuCalibrationOffsets[segment] = simd_quatf(R)
-            calibratedCount += 1
-        }
-
-        // Phase 3: Shanks
-        for segment in shankSegmentList {
-            guard let pose1 = pose1IMUData[segment], let pose2 = pose2IMUData[segment] else { continue }
-
-            let enuDown = SIMD3<Float>(0, 0, -1)
-            let limbDownLocal = simd_normalize(rotateVector(enuDown, by: pose1.inverse))
-            imuLimbDownAxis[segment] = limbDownLocal
-
-            let limbDown1 = rotateVector(limbDownLocal, by: pose1)
-            let e_down = simd_normalize(limbDown1)
-            let limbDown2 = rotateVector(limbDownLocal, by: pose2)
-
-            let proj = simd_dot(limbDown2, e_down) * e_down
-            let swingRaw = limbDown2 - proj
-            guard simd_length(swingRaw) > 0.01 else { continue }
-            let e_swing = simd_normalize(swingRaw)
-            let e_normal = simd_normalize(simd_cross(e_down, e_swing))
-
-            let t_down = SIMD3<Float>(0, -1, 0)
-            let t_fwd = SIMD3<Float>(0, 0, -1)
-            let t_normal = simd_normalize(simd_cross(t_down, t_fwd))
-            let yawQ = simd_quatf(angle: -calibrationHeadsetYaw, axis: SIMD3<Float>(0, 1, 0))
-            let target_down   = rotateVector(t_down, by: yawQ)
-            let target_fwd    = rotateVector(t_fwd, by: yawQ)
-            let target_normal = rotateVector(t_normal, by: yawQ)
-
-            let M_src = simd_float3x3(columns: (e_normal, e_down, e_swing))
-            let M_tgt = simd_float3x3(columns: (target_normal, target_down, target_fwd))
-            let R = M_tgt * M_src.transpose
-
-            imuCalibrationOffsets[segment] = simd_quatf(R)
-            calibratedCount += 1
-        }
-
-        // Phase 4: Chest
+        // Chest (single-pose, gravity + headset forward).
         if let chestPose1 = pose1IMUData[chestSegment] {
             let gravityLocal = detectLimbDownAxis(pose: chestPose1)
-            let forwardLocal = detectChestForwardAxis(pose: chestPose1, headsetForward: calibrationHeadsetForwardAVP)
+            let forwardLocal = detectChestForwardAxis(pose: chestPose1, headsetForward: calibrationHeadsetForwardAVP, excludeAxis: gravityLocal)
             chestForwardLocalAxis = forwardLocal
 
             let e_down = simd_normalize(rotateVector(gravityLocal, by: chestPose1))
@@ -609,19 +645,11 @@ class BodyTrackingModel {
             let e_normal = simd_normalize(simd_cross(e_down, e_fwd))
 
             let M_src = simd_float3x3(columns: (e_normal, e_down, e_fwd))
-
-            let t_down = SIMD3<Float>(0, -1, 0)
-            let t_fwd = SIMD3<Float>(0, 0, -1)
-            let t_normal = simd_normalize(simd_cross(t_down, t_fwd))
-            let yawQ = simd_quatf(angle: -calibrationHeadsetYaw, axis: SIMD3<Float>(0, 1, 0))
-            let target_down   = rotateVector(t_down, by: yawQ)
-            let target_fwd    = rotateVector(t_fwd, by: yawQ)
-            let target_normal = rotateVector(t_normal, by: yawQ)
-
-            let M_tgt = simd_float3x3(columns: (target_normal, target_down, target_fwd))
+            let M_tgt = simd_float3x3(columns: (target_normal_p1, target_down_p1, target_fwd_p1))
             let R = M_tgt * M_src.transpose
 
-            imuCalibrationOffsets[chestSegment] = simd_quatf(R)
+            imuLeftFix[chestSegment]  = simd_quatf(R)
+            imuRightFix[chestSegment] = simd_quatf(ix: 0, iy: 0, iz: 0, r: 1)
             calibratedCount += 1
         }
 
@@ -632,13 +660,9 @@ class BodyTrackingModel {
         }
 
         calibrationState = .calibrated
-        print("CALIBRATION COMPLETE! (\(calibratedCount)/\(activeSegments.count) devices)")
+        print("CALIBRATION COMPLETE (\(calibratedCount)/\(activeSegments.count) devices)")
 
-        // Stop all non-chest IMU streams post-calibration
-        for segment in activeSegments where segment != chestSegment {
-            sendIMUCommand(segment: segment, command: "STOP")
-        }
-
+        // Chest always streams — it provides the body reference frame.
         sendIMUCommand(segment: chestSegment, command: "START")
         imuStreamingSegments.insert(chestSegment)
         Task {
@@ -651,18 +675,24 @@ class BodyTrackingModel {
             }
         }
 
-        for seg in activeSegments where seg != chestSegment {
-            imuStreamingSegments.remove(seg)
-        }
+        // Reset collision/motor state.
         for seg in activeSegments {
-            motorCollisionCounts[seg] = 0
+            motorLevelCollisionCounts[seg] = ["far": 0, "med": 0]
+            motorCurrentLevel[seg] = nil
             motorIsOn[seg] = false
         }
         for (_, timer) in motorOffDebounceTimers { timer.invalidate() }
         motorOffDebounceTimers.removeAll()
 
+        // Show all skeletons after calibration and start all limb IMUs.
         handManager.setAllLimbsActive(true)
-        areSkeletonsActive = true
+        areUpperLimbsActive = true
+        areLowerLimbsActive = true
+        for seg in activeSegments where seg != chestSegment {
+            if let nodeID = segmentToNodeID[seg] {
+                lastSentCommand.removeValue(forKey: "\(nodeID)_imu")
+            }
+        }
         startAllLimbIMUs()
 
         isMotorEnabled = false
@@ -683,15 +713,23 @@ class BodyTrackingModel {
         calibrationCountdownSeconds = nil
         calibrationCountdownTotalSeconds = nil
         calibrationState = .notCalibrated
-        imuCalibrationOffsets.removeAll()
+        imuLeftFix.removeAll()
+        imuRightFix.removeAll()
         imuLimbDownAxis.removeAll()
         pose1IMUData.removeAll()
         pose2IMUData.removeAll()
-        drState.removeAll()
-        lastDRFrameTime = 0
+        rawBeforeStop.removeAll()
+        pendingYawResync.removeAll()
+        hasStoppedLimbsThisSession = false
+        pendingLimbStopTask?.cancel()
+        pendingLimbStopTask = nil
+        lastDispatchedRaw.removeAll()
+        handManager.resetParentOrientations()
         hasChestYawTarget = false
         chestYawTarget = simd_quatf(ix: 0, iy: 0, iz: 0, r: 1)
         chestYawDisplay = simd_quatf(ix: 0, iy: 0, iz: 0, r: 1)
+        hasChestYawReference = false
+        chestYawReference = simd_quatf(ix: 0, iy: 0, iz: 0, r: 1)
 
         handManager.chestYawDelta = simd_quatf(ix: 0, iy: 0, iz: 0, r: 1)
         handManager.chestYawDeltaInverse = simd_quatf(ix: 0, iy: 0, iz: 0, r: 1)
@@ -711,13 +749,18 @@ class BodyTrackingModel {
                 sendMotorCommand(segment: seg, on: false)
             }
             motorIsOn[seg] = false
-            motorCollisionCounts[seg] = 0
+            motorLevelCollisionCounts[seg] = ["far": 0, "med": 0]
+            motorCurrentLevel[seg] = nil
         }
         for (_, timer) in motorOffDebounceTimers { timer.invalidate() }
         motorOffDebounceTimers.removeAll()
+
         isMotorEnabled = false
 
-        areSkeletonsActive = false
+        areUpperLimbsActive = false
+        areLowerLimbsActive = false
+        upperActivationCollisionCount = 0
+        lowerActivationCollisionCount = 0
 
         if triggerAutoRecalibration {
             autoCalibrationScheduled = false
@@ -727,39 +770,108 @@ class BodyTrackingModel {
         }
     }
 
+    /// q_calibrated = leftFix · raw · rightFix
     private func applyIMUCalibration(segment: String, raw: simd_quatf) -> simd_quatf {
-        guard isIMUCalibrated, let calibrationQ = imuCalibrationOffsets[segment] else {
+        guard isIMUCalibrated,
+              let leftFix  = imuLeftFix[segment],
+              let rightFix = imuRightFix[segment] else {
             return raw
         }
+        return leftFix * raw * rightFix
+    }
 
-        var correctedRaw = raw
-        if let limbAxis = imuLimbDownAxis[segment] {
-            let defaultDown = SIMD3<Float>(0, -1, 0)
-            if simd_dot(limbAxis, defaultDown) < 0.99 {
-                let preRotation = shortestRotation(from: defaultDown, to: limbAxis)
-                correctedRaw = raw * preRotation
-            }
+    /// Solves leftFix + rightFix for one limb segment from pose1 and pose2 IMU data.
+    @discardableResult
+    private func solveLimbCorrection(
+        segment: String,
+        useAutoDetectedLimbAxis: Bool,
+        target_down: SIMD3<Float>,
+        target_fwd: SIMD3<Float>,
+        target_normal: SIMD3<Float>,
+        target_up_pose2: SIMD3<Float>
+    ) -> Bool {
+        guard let pose1 = pose1IMUData[segment],
+              let pose2 = pose2IMUData[segment] else {
+            return false
         }
 
-        let calibrated = calibrationQ * correctedRaw
-
-        if segment != chestSegment {
-            return buildLimbOrientation(calibrated: calibrated)
+        // 1. Body-frame limb-down axis.
+        let limbAxisBody: SIMD3<Float>
+        if useAutoDetectedLimbAxis {
+            // BNO086 reports ENU; ENU down = (0,0,-1). Express it in sensor body frame.
+            let enuDown = SIMD3<Float>(0, 0, -1)
+            limbAxisBody = simd_normalize(rotateVector(enuDown, by: pose1.inverse))
+        } else {
+            limbAxisBody = SIMD3<Float>(0, -1, 0)
         }
+        imuLimbDownAxis[segment] = limbAxisBody
 
-        return calibrated
+        // 2. Gram-Schmidt source basis in world (ENU).
+        let limbDown1 = rotateVector(limbAxisBody, by: pose1)
+        let e_down = simd_normalize(limbDown1)
+        let limbDown2 = rotateVector(limbAxisBody, by: pose2)
+        let proj = simd_dot(limbDown2, e_down) * e_down
+        let swingRaw = limbDown2 - proj
+        guard simd_length(swingRaw) > 0.01 else {
+            return false
+        }
+        let e_swing  = simd_normalize(swingRaw)
+        let e_normal = simd_normalize(simd_cross(e_down, e_swing))
+
+        let M_src = simd_float3x3(columns: (e_normal, e_down, e_swing))
+        let M_tgt = simd_float3x3(columns: (target_normal, target_down, target_fwd))
+        let R = M_tgt * M_src.transpose
+        let leftFix = simd_quatf(R)
+
+        // 3. preRotation maps cylinder-local (0,-1,0) onto the sensor's physical limb axis.
+        let preRotation = shortestRotation(from: SIMD3<Float>(0, -1, 0), to: limbAxisBody)
+
+        // 4. Axial-DOF correction: at pose 2 the limb is horizontal; compare cylinder +Z
+        // world direction against target_up_pose2 (+Y), measured in the plane ⟂ to limb.
+        let calibrated_p2_pre = leftFix * pose2 * preRotation
+        let observed_top = rotateVector(SIMD3<Float>(0, 0, 1), by: calibrated_p2_pre)
+        let limbDir_p2   = rotateVector(SIMD3<Float>(0, -1, 0), by: calibrated_p2_pre)
+        let axialAngle = signedAngleAround(axis: limbDir_p2,
+                                           from: observed_top,
+                                           to:   target_up_pose2)
+        let axialFix = simd_quatf(angle: axialAngle, axis: SIMD3<Float>(0, -1, 0))
+        let rightFix = preRotation * axialFix
+
+        imuLeftFix[segment]  = leftFix
+        imuRightFix[segment] = rightFix
+        return true
+    }
+
+    /// Signed angle from `a` to `b` measured around `axis` (right-hand rule).
+    /// `a` and `b` are projected onto the plane perpendicular to `axis`.
+    private func signedAngleAround(axis: SIMD3<Float>, from a: SIMD3<Float>, to b: SIMD3<Float>) -> Float {
+        let n = simd_normalize(axis)
+        let aPerp = a - n * simd_dot(a, n)
+        let bPerp = b - n * simd_dot(b, n)
+        if simd_length(aPerp) < 1e-4 || simd_length(bPerp) < 1e-4 { return 0 }
+        let aN = simd_normalize(aPerp)
+        let bN = simd_normalize(bPerp)
+        let s = simd_dot(simd_cross(aN, bN), n)
+        let c = simd_dot(aN, bN)
+        return atan2(s, c)
     }
 
     // MARK: - Chest Yaw Tracking
 
+    /// Extracts chest yaw as a pure twist around AVP world +Y.
+    /// Avoids coupling to chest local forward-axis auto-detection and prevents
+    /// roll/pitch (or wrong-axis twist) from leaking into the heading estimate.
     private func updateChestYaw(calibrated: simd_quatf) {
-        let forward = rotateVector(chestForwardLocalAxis, by: calibrated)
-        let hLen = sqrt(forward.x * forward.x + forward.z * forward.z)
-        guard hLen > 0.01 else { return }
-        let currentChestYaw = atan2(forward.x, -forward.z)
-        let deltaYaw = currentChestYaw - calibrationHeadsetYaw
+        let currentYawOnly = extractYawOnlyWorldY(from: calibrated)
 
-        let target = simd_quatf(angle: -deltaYaw, axis: SIMD3<Float>(0, 1, 0))
+        // Anchor to the FIRST post-calibration reading so chestYawDelta starts at
+        // identity — the skeleton's heading matches calibrationHeadingQ at T=0.
+        if !hasChestYawReference {
+            chestYawReference = currentYawOnly
+            hasChestYawReference = true
+        }
+
+        let target = chestYawReference.inverse * currentYawOnly
         chestYawTarget = target
 
         if !hasChestYawTarget {
@@ -770,35 +882,23 @@ class BodyTrackingModel {
         }
     }
 
-    private func buildLimbOrientation(calibrated: simd_quatf) -> simd_quatf {
-        let limbDir = simd_normalize(rotateVector(SIMD3<Float>(0, -1, 0), by: calibrated))
+    /// Returns the yaw-only component of `q` as a twist around AVP world +Y
+    /// via swing-twist decomposition.
+    private func extractYawOnlyWorldY(from q: simd_quatf) -> simd_quatf {
+        let qn = q.normalized
+        let axis = SIMD3<Float>(0, 1, 0)
+        let v = SIMD3<Float>(qn.imag.x, qn.imag.y, qn.imag.z)
+        let proj = axis * simd_dot(v, axis)
+        let twist = simd_quatf(ix: proj.x, iy: proj.y, iz: proj.z, r: qn.real)
 
-        let refForward = simd_act(handManager.absoluteHeading, SIMD3<Float>(0, 0, -1))
-
-        let negY = limbDir
-        let posY = -negY
-
-        var zRaw = refForward - simd_dot(refForward, negY) * negY
-        if simd_length(zRaw) < 0.01 {
-            zRaw = simd_cross(SIMD3<Float>(0, 1, 0), negY)
+        let mag2 = twist.real * twist.real
+            + twist.imag.x * twist.imag.x
+            + twist.imag.y * twist.imag.y
+            + twist.imag.z * twist.imag.z
+        guard mag2 > 1e-8 else {
+            return simd_quatf(ix: 0, iy: 0, iz: 0, r: 1)
         }
-        let zAxis = simd_normalize(zRaw)
-        let xAxis = simd_cross(posY, zAxis)
-
-        let R = simd_float3x3(columns: (xAxis, posY, zAxis))
-        return simd_quatf(R)
-    }
-
-    private func quatIntegrate(_ q: simd_quatf, omega: SIMD3<Float>, dt: Float) -> simd_quatf {
-        let omegaQuat = simd_quatf(ix: omega.x, iy: omega.y, iz: omega.z, r: 0)
-        let qdot = 0.5 * q * omegaQuat
-        let integrated = simd_quatf(
-            ix: q.imag.x + qdot.imag.x * dt,
-            iy: q.imag.y + qdot.imag.y * dt,
-            iz: q.imag.z + qdot.imag.z * dt,
-            r:  q.real   + qdot.real   * dt
-        )
-        return integrated.normalized
+        return twist.normalized
     }
 
     // MARK: - Calibration Helpers
@@ -823,7 +923,7 @@ class BodyTrackingModel {
         return simd_quatf(angle: angle, axis: axis)
     }
 
-    private func detectChestForwardAxis(pose: simd_quatf, headsetForward: SIMD3<Float>) -> SIMD3<Float> {
+    private func detectChestForwardAxis(pose: simd_quatf, headsetForward: SIMD3<Float>, excludeAxis: SIMD3<Float>? = nil) -> SIMD3<Float> {
         let candidateAxes: [SIMD3<Float>] = [
             SIMD3<Float>( 1, 0, 0), SIMD3<Float>(-1, 0, 0),
             SIMD3<Float>( 0, 1, 0), SIMD3<Float>( 0,-1, 0),
@@ -834,6 +934,7 @@ class BodyTrackingModel {
         var bestAxis = SIMD3<Float>(0, 1, 0)
         var bestDot: Float = -2.0
         for candidate in candidateAxes {
+            if let exclude = excludeAxis, abs(simd_dot(candidate, exclude)) > 0.9 { continue }
             let worldDir = rotateVector(candidate, by: pose)
             let horizontal = SIMD3<Float>(worldDir.x, worldDir.y, 0)
             guard simd_length(horizontal) > 0.1 else { continue }
@@ -852,6 +953,7 @@ class BodyTrackingModel {
             SIMD3<Float>( 0, 1, 0), SIMD3<Float>( 0,-1, 0),
             SIMD3<Float>( 0, 0, 1), SIMD3<Float>( 0, 0,-1),
         ]
+        // ENU down is (0,0,-1).
         let enuDown = SIMD3<Float>(0, 0, -1)
 
         var bestAxis = SIMD3<Float>(0, -1, 0)
@@ -867,125 +969,235 @@ class BodyTrackingModel {
         return bestAxis
     }
 
-    // MARK: - Collision Handling
+    // MARK: - Yaw-Resync on STOP->START
 
-    /// Distance-based activation: checks if any obstacle entity is within activationRadius of the headset.
-    private func checkActivationByDistance(headsetTransform: simd_float4x4) {
-        let headPos = SIMD3<Float>(headsetTransform.columns.3.x, headsetTransform.columns.3.y, headsetTransform.columns.3.z)
-
-        var nearbyObstacle = false
-        for entity in obstacleEntities {
-            let entityPos = entity.position(relativeTo: nil)
-            let distance = simd_length(entityPos - headPos)
-            if distance < activationRadius {
-                nearbyObstacle = true
-                break
+    /// Snapshots each currently-streaming limb's latest raw quaternion before a STOP.
+    private func snapshotRawForYawResync() {
+        rawBeforeStop.removeAll()
+        pendingYawResync.removeAll()
+        for seg in imuStreamingSegments where seg != chestSegment && imuLeftFix[seg] != nil {
+            if let raw = lastIMUOrientations[seg] {
+                rawBeforeStop[seg] = raw
+                pendingYawResync.insert(seg)
             }
         }
+    }
 
-        if nearbyObstacle && !areSkeletonsActive {
-            areSkeletonsActive = true
-            handManager.setAllLimbsActive(true)
-            startAllLimbIMUs()
-        } else if !nearbyObstacle && areSkeletonsActive {
-            // Keep the virtual skeleton visible after calibration even when no obstacle is nearby.
-            // We still force motors off for safety when outside activation radius.
-            for seg in activeSegments where motorIsOn[seg] ?? false {
+    /// Projects a quaternion onto a specified axis and returns the twist component.
+    private func extractYawOnly(from q: simd_quatf, axis: SIMD3<Float>) -> simd_quatf {
+        let qn = q.normalized
+        let n  = simd_normalize(axis)
+        let v  = SIMD3<Float>(qn.imag.x, qn.imag.y, qn.imag.z)
+        let proj = n * simd_dot(v, n)
+        let twist = simd_quatf(ix: proj.x, iy: proj.y, iz: proj.z, r: qn.real)
+        let mag2 = twist.real * twist.real
+            + twist.imag.x * twist.imag.x
+            + twist.imag.y * twist.imag.y
+            + twist.imag.z * twist.imag.z
+        guard mag2 > 1e-8 else {
+            return simd_quatf(ix: 0, iy: 0, iz: 0, r: 1)
+        }
+        return twist.normalized
+    }
+
+    /// First post-restart packet: compare yaw to the pre-stop snapshot and fold
+    /// the inverse drift into leftFix so AVP-frame output stays aligned.
+    private func applyYawResyncIfNeeded(segment: String, currentRaw: simd_quatf) {
+        guard pendingYawResync.contains(segment) else { return }
+
+        guard let rawOld = rawBeforeStop[segment] else {
+            pendingYawResync.remove(segment)
+            return
+        }
+        guard let leftFix = imuLeftFix[segment] else {
+            pendingYawResync.remove(segment)
+            rawBeforeStop.removeValue(forKey: segment)
+            return
+        }
+
+        let driftFull = currentRaw * rawOld.inverse
+        let enuVertical = SIMD3<Float>(0, 0, 1)
+        let driftYawENU = extractYawOnly(from: driftFull, axis: enuVertical)
+
+        imuLeftFix[segment] = leftFix * driftYawENU.inverse
+
+        pendingYawResync.remove(segment)
+        rawBeforeStop.removeValue(forKey: segment)
+    }
+
+    private func logSegmentIfDue(segment: String, raw: simd_quatf, calibrated: simd_quatf) {
+        let now = CACurrentMediaTime()
+        let last = lastQuatLogTime[segment] ?? 0
+        if now - last < 1.0 { return }
+        lastQuatLogTime[segment] = now
+    }
+
+    // MARK: - Activation Trigger Handling
+
+    private func refreshActivationTriggers() {
+        let shape = ShapeResource.generateBox(
+            width: activationTriggerWidth,
+            height: activationTriggerHeight,
+            depth: activationTriggerDepth
+        )
+        for trigger in [upperActivationTrigger, lowerActivationTrigger] {
+            guard let trigger = trigger else { continue }
+            var collision = CollisionComponent(shapes: [shape])
+            collision.filter = CollisionFilter(group: .skeleton, mask: .obstacle)
+            trigger.components.set(collision)
+        }
+    }
+
+    private func handleActivationBegan(zone: String) {
+        guard isIMUCalibrated else { return }
+
+        if zone == "upper" {
+            upperActivationCollisionCount += 1
+            areUpperLimbsActive = true
+        } else if zone == "lower" {
+            lowerActivationCollisionCount += 1
+            areLowerLimbsActive = true
+        }
+
+        // Skeleton visibility and IMU streaming stay on continuously after
+        // calibration — CrossWalk has a single wandering obstacle, so tying
+        // them to trigger-volume occupancy would make the avatar flicker.
+    }
+
+    private func handleActivationEnded(zone: String) {
+        if zone == "upper" {
+            upperActivationCollisionCount = max(0, upperActivationCollisionCount - 1)
+            guard upperActivationCollisionCount == 0 else { return }
+            areUpperLimbsActive = false
+            for seg in activeSegments where !legSegments.contains(seg) && (motorIsOn[seg] ?? false) {
                 sendMotorCommand(segment: seg, on: false)
                 motorIsOn[seg] = false
+                motorLevelCollisionCounts[seg] = ["far": 0, "med": 0]
+                motorCurrentLevel[seg] = nil
+            }
+        } else if zone == "lower" {
+            lowerActivationCollisionCount = max(0, lowerActivationCollisionCount - 1)
+            guard lowerActivationCollisionCount == 0 else { return }
+            areLowerLimbsActive = false
+            for seg in legSegments where motorIsOn[seg] ?? false {
+                sendMotorCommand(segment: seg, on: false)
+                motorIsOn[seg] = false
+                motorLevelCollisionCounts[seg] = ["far": 0, "med": 0]
+                motorCurrentLevel[seg] = nil
             }
         }
+    }
+
+    // MARK: - Collision Handling
+
+    private enum CollisionTarget {
+        case segment(skeletonID: String, segment: String, level: String)
+        case activation(zone: String)
+    }
+
+    private func parseCollisionTarget(entityAName: String, entityBName: String) -> CollisionTarget? {
+        if let target = parseCollisionTarget(from: entityAName) {
+            return target
+        }
+        return parseCollisionTarget(from: entityBName)
+    }
+
+    private func parseCollisionTarget(from name: String) -> CollisionTarget? {
+        // "center_segmentDetectionTrigger_<segment>_<level>" where level is "far" or "med"
+        if name.hasPrefix("center_segment") {
+            let parts = name.split(separator: "_")
+            guard parts.count >= 4 else { return nil }
+            let skeletonID = String(parts[0])
+            let segment = String(parts[2])
+            let level = String(parts[3])
+            return .segment(skeletonID: skeletonID, segment: segment, level: level)
+        }
+
+        if name.hasPrefix("headsetActivationTrigger_") {
+            let zone = String(name.dropFirst("headsetActivationTrigger_".count))
+            if zone == "upper" || zone == "lower" {
+                return .activation(zone: zone)
+            }
+        }
+
+        return nil
     }
 
     private func handleCollisionBegan(_ event: CollisionEvents.Began) {
-        let nameA = event.entityA.name
-        let nameB = event.entityB.name
-        let triggerName: String
-        if nameA.hasPrefix("center_segment") || nameA.hasPrefix("left_segment") || nameA.hasPrefix("right_segment") {
-            triggerName = nameA
-        } else if nameB.hasPrefix("center_segment") || nameB.hasPrefix("left_segment") || nameB.hasPrefix("right_segment") {
-            triggerName = nameB
-        } else {
+        guard let target = parseCollisionTarget(entityAName: event.entityA.name, entityBName: event.entityB.name) else {
             return
         }
 
-        let parts = triggerName.split(separator: "_", maxSplits: 2)
-        guard parts.count >= 3 else { return }
-        let skeletonID = String(parts[0])
-        let segment = String(parts[2])
+        switch target {
+        case .segment(let skeletonID, let segment, let level):
+            guard let motorTarget = mapCollisionToMotor(skeletonID: skeletonID, segment: segment) else { return }
 
-        guard let motorTarget = mapCollisionToMotor(skeletonID: skeletonID, segment: segment) else { return }
+            motorLevelCollisionCounts[motorTarget, default: [:]][level, default: 0] += 1
 
-        motorCollisionCounts[motorTarget, default: 0] += 1
+            if let imuSeg = HandTrackingManager.IMUBodySegment(rawValue: segment) {
+                handManager.setSegmentCollisionIndicator(skeletonID: skeletonID, segment: imuSeg, isColliding: true)
+            }
 
-        if let imuSeg = HandTrackingManager.IMUBodySegment(rawValue: segment) {
-            handManager.setSegmentCollisionIndicator(skeletonID: skeletonID, segment: imuSeg, isColliding: true)
+            updateMotorForLevelChange(segment: motorTarget)
+
+        case .activation(let zone):
+            handleActivationBegan(zone: zone)
         }
-
-        motorStart(segment: motorTarget)
     }
 
     private func handleCollisionEnded(_ event: CollisionEvents.Ended) {
-        let nameA = event.entityA.name
-        let nameB = event.entityB.name
-        let triggerName: String
-        if nameA.hasPrefix("center_segment") || nameA.hasPrefix("left_segment") || nameA.hasPrefix("right_segment") {
-            triggerName = nameA
-        } else if nameB.hasPrefix("center_segment") || nameB.hasPrefix("left_segment") || nameB.hasPrefix("right_segment") {
-            triggerName = nameB
-        } else {
+        guard let target = parseCollisionTarget(entityAName: event.entityA.name, entityBName: event.entityB.name) else {
             return
         }
 
-        let parts = triggerName.split(separator: "_", maxSplits: 2)
-        guard parts.count >= 3 else { return }
-        let skeletonID = String(parts[0])
-        let segment = String(parts[2])
+        switch target {
+        case .segment(let skeletonID, let segment, let level):
+            guard let motorTarget = mapCollisionToMotor(skeletonID: skeletonID, segment: segment) else { return }
 
-        guard let motorTarget = mapCollisionToMotor(skeletonID: skeletonID, segment: segment) else { return }
+            let cur = motorLevelCollisionCounts[motorTarget, default: [:]][level, default: 0]
+            motorLevelCollisionCounts[motorTarget, default: [:]][level] = max(0, cur - 1)
 
-        motorCollisionCounts[motorTarget, default: 0] = max(0, (motorCollisionCounts[motorTarget] ?? 0) - 1)
-
-        if motorCollisionCounts[motorTarget, default: 0] == 0 {
-            if let imuSeg = HandTrackingManager.IMUBodySegment(rawValue: segment) {
-                handManager.setSegmentCollisionIndicator(skeletonID: skeletonID, segment: imuSeg, isColliding: false)
+            let deepest = deepestActiveLevel(for: motorTarget)
+            if deepest == nil {
+                if let imuSeg = HandTrackingManager.IMUBodySegment(rawValue: segment) {
+                    handManager.setSegmentCollisionIndicator(skeletonID: skeletonID, segment: imuSeg, isColliding: false)
+                }
+                motorScheduleStop(segment: motorTarget)
+            } else {
+                updateMotorForLevelChange(segment: motorTarget)
             }
-        }
 
-        if motorCollisionCounts[motorTarget, default: 0] == 0 {
-            motorScheduleStop(segment: motorTarget)
+        case .activation(let zone):
+            handleActivationEnded(zone: zone)
         }
     }
 
     // MARK: - Motor Mapping
 
+    /// Single superimposed skeleton: direct 1:1 mapping.
     private func mapCollisionToMotor(skeletonID: String, segment: String) -> String? {
-        switch skeletonID {
-        case "center":
-            return activeSegments.contains(segment) ? segment : nil
-        case "left":
-            if segment.contains("UpperArm") || segment.contains("Forearm") { return "leftForearm" }
-            else if segment.contains("Thigh") { return "leftThigh" }
-            else if segment.contains("Shank") { return "leftShank" }
-        case "right":
-            if segment.contains("UpperArm") || segment.contains("Forearm") { return "rightForearm" }
-            else if segment.contains("Thigh") { return "rightThigh" }
-            else if segment.contains("Shank") { return "rightShank" }
-        default:
-            return nil
-        }
-        return nil
+        guard skeletonID == "center" else { return nil }
+        return activeSegments.contains(segment) ? segment : nil
     }
 
     // MARK: - Motor Control
 
-    private func motorStart(segment: String) {
+    private func updateMotorForLevelChange(segment: String) {
         motorOffDebounceTimers[segment]?.invalidate()
         motorOffDebounceTimers.removeValue(forKey: segment)
         guard isMotorEnabled else { return }
-        guard !(motorIsOn[segment] ?? false) else { return }
-        sendMotorCommand(segment: segment, on: true)
-        motorIsOn[segment] = true
+
+        let deepest = deepestActiveLevel(for: segment)
+        let previous = motorCurrentLevel[segment] ?? nil
+
+        guard deepest != previous else { return }
+
+        if let level = deepest {
+            let shellIndex = (level == "med") ? 1 : 2  // med=MED, far=FAR
+            sendMotorCommand(segment: segment, on: true, shellIndex: shellIndex)
+            motorIsOn[segment] = true
+            motorCurrentLevel[segment] = level
+        }
     }
 
     private func motorScheduleStop(segment: String) {
@@ -996,9 +1208,10 @@ class BodyTrackingModel {
         ) { [weak self] _ in
             Task { @MainActor in
                 guard let self = self else { return }
-                if self.motorCollisionCounts[segment, default: 0] == 0 {
+                if self.deepestActiveLevel(for: segment) == nil {
                     self.sendMotorCommand(segment: segment, on: false)
                     self.motorIsOn[segment] = false
+                    self.motorCurrentLevel[segment] = nil
                 }
             }
         }
@@ -1071,6 +1284,21 @@ class BodyTrackingModel {
         await handManager.processHandUpdates()
     }
 
+    func monitorSessionEvents() async {
+        for await event in session.events {
+            switch event {
+            case .authorizationChanged(let type, let status):
+                if type == .worldSensing && status != .allowed {
+                    errorMessage = "World sensing authorization denied."
+                }
+            case .dataProviderStateChanged(_, _, let error):
+                _ = error
+            @unknown default:
+                break
+            }
+        }
+    }
+
     // MARK: - Manual Override Toggles
 
     func toggleMotorEnabled() {
@@ -1081,6 +1309,8 @@ class BodyTrackingModel {
             for seg in activeSegments where motorIsOn[seg] ?? false {
                 sendMotorCommand(segment: seg, on: false)
                 motorIsOn[seg] = false
+                motorLevelCollisionCounts[seg] = ["far": 0, "med": 0]
+                motorCurrentLevel[seg] = nil
                 motorOffDebounceTimers[seg]?.invalidate()
                 motorOffDebounceTimers.removeValue(forKey: seg)
             }
@@ -1092,13 +1322,15 @@ class BodyTrackingModel {
         print("IMU override \(isIMUOverrideActive ? "ON (all STOPPED)" : "OFF (re-syncing)")")
 
         if isIMUOverrideActive {
+            // Snapshot first so yaw-resync can compensate when streams restart.
+            snapshotRawForYawResync()
             for seg in activeSegments where imuStreamingSegments.contains(seg) {
                 if seg == chestSegment { continue }
                 sendIMUCommand(segment: seg, command: "STOP")
                 imuStreamingSegments.remove(seg)
             }
         } else {
-            if areSkeletonsActive {
+            if areUpperLimbsActive || areLowerLimbsActive {
                 startAllLimbIMUs()
             }
         }

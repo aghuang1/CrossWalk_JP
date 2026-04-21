@@ -14,11 +14,12 @@ struct CrossWalk_TokyoApp: App {
     @State private var bodyModel = BodyTrackingModel()
 
     var body: some Scene {
-        WindowGroup {
-            ContentView()
-                .environment(appModel)
-        }
-
+        // Immersive space listed first + declared as the app's default scene role
+        // (see Info.plist -> UISceneSessionRoleImmersiveSpaceApplication) so the
+        // app launches directly into the Tokyo scene. This gives it the full
+        // walking envelope Apple grants to immersive-first apps like Ping Pong
+        // Club, instead of the conservative boundary applied to window apps that
+        // only optionally open an immersive space.
         ImmersiveSpace(id: appModel.immersiveSpaceID) {
             ImmersiveView()
                 .environment(appModel)
@@ -31,6 +32,11 @@ struct CrossWalk_TokyoApp: App {
                 }
         }
         .immersionStyle(selection: .constant(.full), in: .full)
+
+        WindowGroup {
+            ContentView()
+                .environment(appModel)
+        }
 
         // Calibration control panel (separate window)
         WindowGroup(id: "calibrationPanel") {

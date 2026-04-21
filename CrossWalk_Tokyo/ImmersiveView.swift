@@ -13,6 +13,7 @@ struct ImmersiveView: View {
     @Environment(BodyTrackingModel.self) var bodyModel
     @Environment(\.openWindow) private var openWindow
 
+    
     // anchors & entities
     @State private var rootAnchorRef: AnchorEntity?
     @State private var headAnchor: AnchorEntity?
@@ -33,6 +34,8 @@ struct ImmersiveView: View {
 
     // Cube wandering reference
     @State private var targetCubeEntity: Entity?
+    @State private var carEntity: Entity?
+    @State private var userStartPosition: SIMD3<Float>?
 
     private let logger = Logger(subsystem: "flavinlab.CrossWalk-Tokyo", category: "WorldTracking")
 
@@ -78,6 +81,24 @@ struct ImmersiveView: View {
                 // Load scene entities asynchronously
                 Task { @MainActor in
                     do {
+                        // Large skydome — inverted sphere so there's always sky on the
+                        // horizon when looking past the Tokyo crosswalk geometry.
+                        let skydomeRadius: Float = 80.0
+                        let skydome = ModelEntity(
+                            mesh: .generateSphere(radius: skydomeRadius),
+                            materials: [{
+                                var m = SimpleMaterial(
+                                    color: UIColor(red: 0.55, green: 0.75, blue: 0.95, alpha: 1.0),
+                                    isMetallic: false
+                                )
+                                m.faceCulling = .front   // render the INSIDE of the sphere
+                                return m
+                            }()]
+                        )
+                        skydome.name = "Skydome"
+                        skydome.position = SIMD3<Float>(0, 0, 0)
+                        rootAnchor.addChild(skydome)
+
                         // Load Tokyo crossing environment (NO collision shapes - visual only)
                         let crossTokyoEntity = try await Entity.load(named: "Crossing_Tokyo")
                         crossTokyoEntity.position.y = 5.95
@@ -109,8 +130,25 @@ struct ImmersiveView: View {
                         rootAnchor.addChild(spawnCube)
                         self.targetCubeEntity = spawnCube
 
-                        // Register obstacle entities with BodyTrackingModel for distance-based activation
-                        bodyModel.obstacleEntities = [spawnCube]
+                        // Car: wide obstacle that drives R→L perpendicular to the user's starting forward.
+                        let car = try await Entity.load(named: "Cube")
+                        car.name = "CarCube"
+                        car.scale = SIMD3<Float>(4.0, 1.8, 2.0)
+                        car.position = SIMD3<Float>(8.0, 0.9, -2.0)
+                        car.generateCollisionShapes(recursive: true)
+                        self.applyObstacleCollisionGroup(to: car)
+                        car.components.set(PhysicsBodyComponent(
+                            shapes: [.generateBox(width: 4.0, height: 1.8, depth: 2.0)],
+                            mass: 0,
+                            mode: .kinematic
+                        ))
+                        if let modelEntity = car as? ModelEntity,
+                           var mc = modelEntity.components[ModelComponent.self] as? ModelComponent {
+                            mc.materials = [SimpleMaterial(color: .red, isMetallic: false)]
+                            modelEntity.components[ModelComponent.self] = mc
+                        }
+                        rootAnchor.addChild(car)
+                        self.carEntity = car
 
                         // Directional light
                         let lightEntity = Entity()
@@ -158,6 +196,26 @@ struct ImmersiveView: View {
                 let wanderX = sin(t * 0.5) * 4.0 + cos(t * 0.3) * 2.0
                 let wanderZ = -3.0 + cos(t * 0.4) * 4.0 + sin(t * 0.2) * 2.0
                 cube.position = SIMD3<Float>(wanderX, 0.85, wanderZ)
+            }
+
+            // Car: drive from +X (user's right) to -X (user's left) at ~2 m/s.
+            // Track range is 16m; cycle is 8s driving + 1s hidden pause then respawn.
+            if let car = carEntity {
+                let carSpeed: Float = 2.0
+                let startX: Float = 8.0
+                let endX: Float = -8.0
+                let driveDistance = startX - endX
+                let driveDuration = driveDistance / carSpeed   // 8s
+                let cycleDuration: Float = driveDuration + 1.0 // 9s total
+                let t = Float(updateTick) * 0.1
+                let phase = t.truncatingRemainder(dividingBy: cycleDuration)
+                let carZ: Float = -2.0
+                if phase < driveDuration {
+                    car.position = SIMD3<Float>(startX - carSpeed * phase, 0.9, carZ)
+                } else {
+                    // Briefly park off-screen before the next pass.
+                    car.position = SIMD3<Float>(startX, 0.9, carZ)
+                }
             }
 
             updateWorldTrackingAndEntities()

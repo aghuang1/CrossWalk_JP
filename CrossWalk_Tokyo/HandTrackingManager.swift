@@ -1,10 +1,18 @@
+/*
+ HandTrackingManager.swift
+ CrossWalk_Tokyo
+
+ Tracks both hands via HandTrackingProvider and builds a single virtual skeleton
+ (center) superimposed on the user. Ported from ExtendedTouch_AVP isotropicExpansion.
+*/
+
 import ARKit
 import RealityKit
 import UIKit
 
-/// Holds all entities for one complete skeleton copy (center, left, or right).
+/// Holds all entities for the single "center" skeleton superimposed on the user.
 struct SkeletonInstance {
-    let id: String  // "center", "left", "right"
+    let id: String
 
     // Arm hierarchy
     var leftShoulderAnchor: Entity?
@@ -37,10 +45,10 @@ struct SkeletonInstance {
 class HandTrackingManager {
     let handTracking = HandTrackingProvider()
 
-    // Palm entities: one ModelEntity per hand (left/right).
+    /// Palm entities: one ModelEntity per hand (left/right). Invisible collision proxies.
     private(set) var palmEntities: [HandAnchor.Chirality: ModelEntity] = [:]
 
-    // IMU-tracked body segments (8 segments: both arms + both legs)
+    /// IMU-tracked body segments (8 segments: both arms + both legs)
     enum IMUBodySegment: String, CaseIterable {
         case leftUpperArm = "leftUpperArm"
         case leftForearm = "leftForearm"
@@ -52,7 +60,7 @@ class HandTrackingManager {
         case rightShank = "rightShank"
     }
 
-    /// Defines the four limb groups that can be independently shown/hidden.
+    /// Four limb groups that can be independently shown/hidden.
     enum LimbGroup {
         case leftArm
         case rightArm
@@ -60,9 +68,15 @@ class HandTrackingManager {
         case rightLeg
     }
 
-    // MARK: - Skeleton Instances
+    // MARK: - Skeleton Instance
 
+    /// Single skeleton instance keyed by id ("center"). Dictionary preserves the
+    /// multi-skeleton API so callers iterating over skeletons keep working.
     var skeletons: [String: SkeletonInstance] = [:]
+
+    /// Segment trigger volumes keyed by segment name + level (e.g. "leftUpperArm_far").
+    /// Used for counter-rotation and runtime dimension updates.
+    private var segmentTriggerEntities: [String: Entity] = [:]
 
     // Segment lengths (in meters)
     private let upperArmLength: Float = 0.28
@@ -74,17 +88,19 @@ class HandTrackingManager {
     let armRadius: Float = 0.05
     let legRadius: Float = 0.06
 
-    // MARK: - Detection Trigger Volumes
-    var upperArmDetectionRadius: Float = 0.08
-    var upperArmDetectionHeight: Float = 0.28
-    var forearmDetectionRadius: Float = 0.08
-    var forearmDetectionHeight: Float = 0.25
-    var thighDetectionRadius: Float = 0.10
-    var thighDetectionHeight: Float = 0.45
-    var shankDetectionRadius: Float = 0.10
-    var shankDetectionHeight: Float = 0.17
+    // MARK: - Detection Trigger Volumes (FAR + MED per segment, box-shaped, adjustable)
+    // Height = along limb axis (y); lateral = x-z expansion
+    var upperArmTriggerHeight: Float = 0.28
+    var upperArmTriggerLateral: Float = 0.50
+    var forearmTriggerHeight: Float = 0.25
+    var forearmTriggerLateral: Float = 0.50
+    var thighTriggerHeight: Float = 0.45
+    var thighTriggerLateral: Float = 0.50
+    var shankTriggerHeight: Float = 0.17
+    var shankTriggerLateral: Float = 0.50
 
-    // Store the last known absolute world orientations for parent segments.
+    // MARK: - Parent Orientation Cache (world-absolute)
+
     private var lastParentOrientations: [IMUBodySegment: simd_quatf] = [
         .leftUpperArm: simd_quatf(ix: 0, iy: 0, iz: 0, r: 1),
         .rightUpperArm: simd_quatf(ix: 0, iy: 0, iz: 0, r: 1),
@@ -92,12 +108,33 @@ class HandTrackingManager {
         .rightThigh: simd_quatf(ix: 0, iy: 0, iz: 0, r: 1),
     ]
 
+    /// Updates a single parent segment's stored orientation. Called from the
+    /// subscription handler (parents-first pass) so children always have fresh
+    /// parent data before computing their local rotation.
+    func updateParentOrientation(segment: IMUBodySegment, orientation: simd_quatf) {
+        lastParentOrientations[segment] = orientation
+    }
+
+    /// Resets parent orientations to identity — call during calibration reset so
+    /// child segments (forearm, shank) don't use stale parent data.
+    func resetParentOrientations() {
+        lastParentOrientations = [
+            .leftUpperArm: simd_quatf(ix: 0, iy: 0, iz: 0, r: 1),
+            .rightUpperArm: simd_quatf(ix: 0, iy: 0, iz: 0, r: 1),
+            .leftThigh: simd_quatf(ix: 0, iy: 0, iz: 0, r: 1),
+            .rightThigh: simd_quatf(ix: 0, iy: 0, iz: 0, r: 1),
+        ]
+    }
+
+    // MARK: - Heading / Chest Yaw
+
     /// Chest yaw delta: rotation from calibration-time facing to current chest facing.
+    /// Updated by BodyTrackingModel from chest IMU data each frame.
     var chestYawDelta: simd_quatf = simd_quatf(ix: 0, iy: 0, iz: 0, r: 1)
     var chestYawDeltaInverse: simd_quatf = simd_quatf(ix: 0, iy: 0, iz: 0, r: 1)
 
-    /// Calibration heading: yaw-only rotation representing which direction the user faced
-    /// during calibration.
+    /// Calibration heading: yaw-only rotation representing which direction the user
+    /// faced during calibration. Set once at calibration time by BodyTrackingModel.
     var calibrationHeadingQ: simd_quatf = simd_quatf(ix: 0, iy: 0, iz: 0, r: 1)
 
     /// Absolute heading = calibration heading + chest yaw delta.
@@ -105,12 +142,15 @@ class HandTrackingManager {
         calibrationHeadingQ * chestYawDelta
     }
 
+    /// World-space forward projection vector used to position the virtual skeleton
+    /// ahead of the user. Subtract from virtual limb positions to get body positions.
     func getForwardProjectionVector(forwardOffset: Float) -> SIMD3<Float> {
         return simd_act(absoluteHeading, SIMD3<Float>(0, 0, forwardOffset))
     }
 
     // MARK: - Setup
 
+    /// Create palm placeholders and build the single "center" skeleton.
     func setupPalms(on contentEntity: Entity) {
         for chirality in [HandAnchor.Chirality.left, HandAnchor.Chirality.right] {
             let placeholder = ModelEntity()
@@ -119,7 +159,8 @@ class HandTrackingManager {
             contentEntity.addChild(placeholder)
         }
 
-        for skeletonID in ["center", "left", "right"] {
+        // Single skeleton superimposed on the user.
+        for skeletonID in ["center"] {
             let instance = buildSkeleton(id: skeletonID, on: contentEntity)
             skeletons[skeletonID] = instance
         }
@@ -192,12 +233,26 @@ class HandTrackingManager {
         applyNoOcclusion(to: shoulderMarker)
         shoulderAnchor.addChild(shoulderMarker)
 
-        let uaDetection = createTriggerVolume(
-            name: "\(skeletonID)_segmentDetectionTrigger_\(segUA)",
-            radius: upperArmDetectionRadius, height: upperArmDetectionHeight, isHorizontal: false
+        // Upper arm detection triggers (FAR + MED), centered at elbow (distal joint).
+        let uaFar = createTriggerVolume(
+            name: "\(skeletonID)_segmentDetectionTrigger_\(segUA)_far",
+            lateral: upperArmTriggerLateral,
+            height: upperArmTriggerHeight,
+            isHorizontal: false
         )
-        uaDetection.position = SIMD3<Float>(0, -upperArmDetectionHeight / 2, 0)
-        shoulderPivot.addChild(uaDetection)
+        uaFar.position = SIMD3<Float>(0, -upperArmLength, 0)
+        shoulderPivot.addChild(uaFar)
+        segmentTriggerEntities["\(segUA)_far"] = uaFar
+
+        let uaMed = createTriggerVolume(
+            name: "\(skeletonID)_segmentDetectionTrigger_\(segUA)_med",
+            lateral: upperArmTriggerLateral / 2,
+            height: upperArmTriggerHeight,
+            isHorizontal: false
+        )
+        uaMed.position = SIMD3<Float>(0, -upperArmLength, 0)
+        shoulderPivot.addChild(uaMed)
+        segmentTriggerEntities["\(segUA)_med"] = uaMed
 
         let elbowPivot = Entity()
         elbowPivot.name = "\(skeletonID)_\(side)ElbowPivot"
@@ -228,12 +283,26 @@ class HandTrackingManager {
         applyNoOcclusion(to: wristMarker)
         elbowPivot.addChild(wristMarker)
 
-        let faDetection = createTriggerVolume(
-            name: "\(skeletonID)_segmentDetectionTrigger_\(segFA)",
-            radius: forearmDetectionRadius, height: forearmDetectionHeight, isHorizontal: false
+        // Forearm detection triggers (FAR + MED), centered at wrist (distal joint).
+        let faFar = createTriggerVolume(
+            name: "\(skeletonID)_segmentDetectionTrigger_\(segFA)_far",
+            lateral: forearmTriggerLateral,
+            height: forearmTriggerHeight,
+            isHorizontal: false
         )
-        faDetection.position = SIMD3<Float>(0, -forearmDetectionHeight / 2, 0)
-        elbowPivot.addChild(faDetection)
+        faFar.position = SIMD3<Float>(0, -forearmLength, 0)
+        elbowPivot.addChild(faFar)
+        segmentTriggerEntities["\(segFA)_far"] = faFar
+
+        let faMed = createTriggerVolume(
+            name: "\(skeletonID)_segmentDetectionTrigger_\(segFA)_med",
+            lateral: forearmTriggerLateral / 2,
+            height: forearmTriggerHeight,
+            isHorizontal: false
+        )
+        faMed.position = SIMD3<Float>(0, -forearmLength, 0)
+        elbowPivot.addChild(faMed)
+        segmentTriggerEntities["\(segFA)_med"] = faMed
 
         return (shoulderAnchor, shoulderPivot, elbowPivot, upperArmCylinder, forearmCylinder)
     }
@@ -269,12 +338,26 @@ class HandTrackingManager {
         applyNoOcclusion(to: hipMarker)
         hipAnchor.addChild(hipMarker)
 
-        let thighDetection = createTriggerVolume(
-            name: "\(skeletonID)_segmentDetectionTrigger_\(segThigh)",
-            radius: thighDetectionRadius, height: thighDetectionHeight, isHorizontal: false
+        // Thigh detection triggers (FAR + MED), centered at knee (distal joint).
+        let thighFar = createTriggerVolume(
+            name: "\(skeletonID)_segmentDetectionTrigger_\(segThigh)_far",
+            lateral: thighTriggerLateral,
+            height: thighTriggerHeight,
+            isHorizontal: false
         )
-        thighDetection.position = SIMD3<Float>(0, -thighDetectionHeight / 2, 0)
-        hipPivot.addChild(thighDetection)
+        thighFar.position = SIMD3<Float>(0, -thighLength, 0)
+        hipPivot.addChild(thighFar)
+        segmentTriggerEntities["\(segThigh)_far"] = thighFar
+
+        let thighMed = createTriggerVolume(
+            name: "\(skeletonID)_segmentDetectionTrigger_\(segThigh)_med",
+            lateral: thighTriggerLateral / 2,
+            height: thighTriggerHeight,
+            isHorizontal: false
+        )
+        thighMed.position = SIMD3<Float>(0, -thighLength, 0)
+        hipPivot.addChild(thighMed)
+        segmentTriggerEntities["\(segThigh)_med"] = thighMed
 
         let kneePivot = Entity()
         kneePivot.name = "\(skeletonID)_\(side)KneePivot"
@@ -305,12 +388,26 @@ class HandTrackingManager {
         applyNoOcclusion(to: ankleMarker)
         kneePivot.addChild(ankleMarker)
 
-        let shankDetection = createTriggerVolume(
-            name: "\(skeletonID)_segmentDetectionTrigger_\(segShank)",
-            radius: shankDetectionRadius, height: shankDetectionHeight, isHorizontal: false
+        // Shank detection triggers (FAR + MED), centered at ankle (distal joint).
+        let shankFar = createTriggerVolume(
+            name: "\(skeletonID)_segmentDetectionTrigger_\(segShank)_far",
+            lateral: shankTriggerLateral,
+            height: shankTriggerHeight,
+            isHorizontal: false
         )
-        shankDetection.position = SIMD3<Float>(0, -shankDetectionHeight / 2, 0)
-        kneePivot.addChild(shankDetection)
+        shankFar.position = SIMD3<Float>(0, -shankLength, 0)
+        kneePivot.addChild(shankFar)
+        segmentTriggerEntities["\(segShank)_far"] = shankFar
+
+        let shankMed = createTriggerVolume(
+            name: "\(skeletonID)_segmentDetectionTrigger_\(segShank)_med",
+            lateral: shankTriggerLateral / 2,
+            height: shankTriggerHeight,
+            isHorizontal: false
+        )
+        shankMed.position = SIMD3<Float>(0, -shankLength, 0)
+        kneePivot.addChild(shankMed)
+        segmentTriggerEntities["\(segShank)_med"] = shankMed
 
         return (hipAnchor, hipPivot, kneePivot, thighCylinder, shankCylinder)
     }
@@ -339,8 +436,14 @@ class HandTrackingManager {
         entity.components.set(ModelSortGroupComponent(group: ModelSortGroup(depthPass: nil), order: 1000))
     }
 
-    private func createTriggerVolume(name: String, radius: Float, height: Float, isHorizontal: Bool) -> Entity {
-        let shape = ShapeResource.generateCapsule(height: height + radius * 2, radius: radius)
+    /// Creates a box-shaped trigger volume that expands laterally.
+    /// lateral = half-width in x and z; height = along limb axis (y).
+    private func createTriggerVolume(name: String, lateral: Float, height: Float, isHorizontal: Bool) -> Entity {
+        let shape = ShapeResource.generateBox(
+            width: lateral * 2,
+            height: height,
+            depth: lateral * 2
+        )
 
         let trigger = TriggerVolume(shape: shape)
         trigger.name = name
@@ -358,6 +461,8 @@ class HandTrackingManager {
 
     // MARK: - Skeleton Positioning
 
+    /// Positions the center skeleton superimposed on the user at the headset position,
+    /// offset radially by `radius` in the direction set by `angles[0]` (typically 0).
     func updateAllSkeletonPositions(
         headsetTransform: simd_float4x4,
         radius: Float,
@@ -374,7 +479,7 @@ class HandTrackingManager {
         )
 
         let heading = absoluteHeading
-        let skeletonIDs = ["center", "left", "right"]
+        let skeletonIDs = ["center"]
 
         for (index, skeletonID) in skeletonIDs.enumerated() {
             guard index < angles.count, let instance = skeletons[skeletonID] else { continue }
@@ -397,6 +502,9 @@ class HandTrackingManager {
 
     // MARK: - IMU Orientation
 
+    /// Updates the orientation of a body segment pivot. For child segments
+    /// (forearm, shank), computes local rotation relative to the last-known
+    /// parent orientation so the cylinder renders in the parent's frame.
     func updateIMUCylinderOrientation(segment: IMUBodySegment, orientation: simd_quatf) {
         let localRotation: simd_quatf?
         switch segment {
@@ -441,17 +549,127 @@ class HandTrackingManager {
     // MARK: - Visibility
 
     func setAllLimbsActive(_ active: Bool) {
-        for (skeletonID, instance) in skeletons {
+        for (_, instance) in skeletons {
             instance.leftShoulderAnchor?.isEnabled = active
             instance.rightShoulderAnchor?.isEnabled = active
             instance.leftHipAnchor?.isEnabled = active
             instance.rightHipAnchor?.isEnabled = active
-            _ = skeletonID
         }
+    }
+
+    /// Upper body (both arms).
+    func setUpperLimbsActive(_ active: Bool) {
+        for (_, instance) in skeletons {
+            instance.leftShoulderAnchor?.isEnabled = active
+            instance.rightShoulderAnchor?.isEnabled = active
+        }
+    }
+
+    /// Lower body (both legs).
+    func setLowerLimbsActive(_ active: Bool) {
+        for (_, instance) in skeletons {
+            instance.leftHipAnchor?.isEnabled = active
+            instance.rightHipAnchor?.isEnabled = active
+        }
+    }
+
+    // MARK: - Trigger Orientation Lock
+
+    /// Counter-rotates all segment trigger volumes so they remain world-axis-aligned
+    /// even as their parent pivots rotate with the IMU data.
+    func resetTriggerOrientations() {
+        for (_, trigger) in segmentTriggerEntities {
+            guard let parent = trigger.parent else { continue }
+            trigger.orientation = parent.orientation(relativeTo: nil).inverse
+        }
+    }
+
+    // MARK: - Runtime Geometry Refresh
+
+    /// Updates all visual cylinders, joint markers, pivot positions, and trigger
+    /// volumes to reflect current dimension values. Call when control panel values change.
+    func refreshGeometry(
+        upperArmLength: Float, upperArmRadius: Float,
+        forearmLength: Float, forearmRadius: Float,
+        thighLength: Float, thighRadius: Float,
+        shankLength: Float, shankRadius: Float,
+        uaTrigH: Float, uaTrigLat: Float,
+        faTrigH: Float, faTrigLat: Float,
+        thTrigH: Float, thTrigLat: Float,
+        shTrigH: Float, shTrigLat: Float
+    ) {
+        for (_, instance) in skeletons {
+            // Arms
+            updateCylinder(instance.leftUpperArmCylinder, height: upperArmLength, radius: upperArmRadius)
+            updateCylinder(instance.rightUpperArmCylinder, height: upperArmLength, radius: upperArmRadius)
+            updateCylinder(instance.leftForearmCylinder, height: forearmLength, radius: forearmRadius)
+            updateCylinder(instance.rightForearmCylinder, height: forearmLength, radius: forearmRadius)
+
+            instance.leftElbowPivot?.position.y = -upperArmLength
+            instance.rightElbowPivot?.position.y = -upperArmLength
+
+            instance.leftElbowPivot?.children.first(where: { $0.name.contains("WristMarker") })?.position.y = -forearmLength
+            instance.rightElbowPivot?.children.first(where: { $0.name.contains("WristMarker") })?.position.y = -forearmLength
+
+            // Legs
+            updateCylinder(instance.leftThighCylinder, height: thighLength, radius: thighRadius)
+            updateCylinder(instance.rightThighCylinder, height: thighLength, radius: thighRadius)
+            updateCylinder(instance.leftShankCylinder, height: shankLength, radius: shankRadius)
+            updateCylinder(instance.rightShankCylinder, height: shankLength, radius: shankRadius)
+
+            instance.leftKneePivot?.position.y = -thighLength
+            instance.rightKneePivot?.position.y = -thighLength
+
+            instance.leftKneePivot?.children.first(where: { $0.name.contains("AnkleMarker") })?.position.y = -shankLength
+            instance.rightKneePivot?.children.first(where: { $0.name.contains("AnkleMarker") })?.position.y = -shankLength
+        }
+
+        // Trigger volumes (FAR + MED per segment, centered at distal joint).
+        let triggerConfigs: [(String, Float, Float, Float)] = [
+            ("leftUpperArm", uaTrigH, uaTrigLat, upperArmLength),
+            ("rightUpperArm", uaTrigH, uaTrigLat, upperArmLength),
+            ("leftForearm", faTrigH, faTrigLat, forearmLength),
+            ("rightForearm", faTrigH, faTrigLat, forearmLength),
+            ("leftThigh", thTrigH, thTrigLat, thighLength),
+            ("rightThigh", thTrigH, thTrigLat, thighLength),
+            ("leftShank", shTrigH, shTrigLat, shankLength),
+            ("rightShank", shTrigH, shTrigLat, shankLength),
+        ]
+        for (seg, h, lat, segLen) in triggerConfigs {
+            if let farTrigger = segmentTriggerEntities["\(seg)_far"] {
+                let shape = ShapeResource.generateBox(width: lat * 2, height: h, depth: lat * 2)
+                var collision = CollisionComponent(shapes: [shape])
+                collision.filter = CollisionFilter(group: .skeleton, mask: .obstacle)
+                farTrigger.components.set(collision)
+                farTrigger.position.y = -segLen
+            }
+            if let medTrigger = segmentTriggerEntities["\(seg)_med"] {
+                let shape = ShapeResource.generateBox(width: lat, height: h, depth: lat)
+                var collision = CollisionComponent(shapes: [shape])
+                collision.filter = CollisionFilter(group: .skeleton, mask: .obstacle)
+                medTrigger.components.set(collision)
+                medTrigger.position.y = -segLen
+            }
+        }
+
+        upperArmTriggerHeight = uaTrigH; upperArmTriggerLateral = uaTrigLat
+        forearmTriggerHeight = faTrigH; forearmTriggerLateral = faTrigLat
+        thighTriggerHeight = thTrigH; thighTriggerLateral = thTrigLat
+        shankTriggerHeight = shTrigH; shankTriggerLateral = shTrigLat
+    }
+
+    private func updateCylinder(_ entity: ModelEntity?, height: Float, radius: Float) {
+        guard let entity = entity else { return }
+        if var modelComp = entity.components[ModelComponent.self] {
+            modelComp.mesh = .generateCylinder(height: height, radius: radius)
+            entity.components.set(modelComp)
+        }
+        entity.position.y = -height / 2
     }
 
     // MARK: - Collision Indicator
 
+    /// Changes a cylinder color to green on collision, or restores the original color when cleared.
     func setSegmentCollisionIndicator(skeletonID: String, segment: IMUBodySegment, isColliding: Bool) {
         guard let instance = skeletons[skeletonID] else { return }
 
