@@ -8,7 +8,7 @@
 import SwiftUI
 
 @main
-struct CrossWalk_TokyoApp: App {
+struct CrossWalk_TokyoApp: App {		
 
     @State private var appModel = AppModel()
     @State private var bodyModel = BodyTrackingModel()

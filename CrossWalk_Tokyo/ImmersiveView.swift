@@ -18,12 +18,22 @@ struct ImmersiveView: View {
     @State private var rootAnchorRef: AnchorEntity?
     @State private var headAnchor: AnchorEntity?
 
-    @State private var headTextEntity: ModelEntity?
-    @State private var lastHeadText: String = ""
+    // Separate head-anchored red "COLLIDED" text, toggled via isEnabled while
+    // `bodyModel.lastCollisionTime` is within `collisionDisplayDuration`.
+    @State private var headCollisionTextEntity: ModelEntity?
+    // Green head-anchored "VICTORY!" text, toggled via isEnabled while
+    // `bodyModel.lastVictoryTime` is within `victoryDisplayDuration`.
+    @State private var headVictoryTextEntity: ModelEntity?
+    // Head-anchored stats line under VICTORY! showing the finished run's
+    // elapsed Time and cars-hit ratio. Mesh is regenerated each time a new
+    // victory fires (detected via `lastRenderedVictoryTime`).
+    @State private var headVictoryStatsEntity: ModelEntity?
+    @State private var lastRenderedVictoryTime: CFTimeInterval = -.infinity
 
-    // GUI state
-    @State private var guiWorldPosition: SIMD3<Float> = .zero
-    @State private var guiOrientationDegrees: SIMD3<Float> = .zero
+    // Head-anchored live elapsed-time readout. Visible while a run is
+    // active; mesh regenerated per 10Hz tick. Hidden once the run ends
+    // (the final time is reported by `headVictoryStatsEntity`).
+    @State private var headRunTimerEntity: ModelEntity?
 
     private var isRunningInPreview: Bool {
         ProcessInfo.processInfo.environment["XCODE_RUNNING_FOR_PREVIEWS"] == "1"
@@ -32,9 +42,25 @@ struct ImmersiveView: View {
     @State private var isWorldTrackingRunning: Bool = false
     @State private var updateTick: Int = 0
 
-    // Cube wandering reference
-    @State private var targetCubeEntity: Entity?
-    @State private var carEntity: Entity?
+    @State private var carEntities: [Entity] = []
+    // Parallel to `carEntities`: the visible toy-car child of each cube, kept
+    // separately so we can scale the visual independently of the cube's hitbox.
+    @State private var toyEntities: [Entity] = []
+    // Native uniform-fit scale for the toy car at hitboxScale=1, computed once
+    // at spawn from `min(hitboxSize / nativeExtents)`. The per-frame timer
+    // applies (visualScale / hitboxScale) on top, then multiplies by this.
+    @State private var baseToyFitScale: Float = 1.0
+    // +1 = R→L (start at +X, drive to -X), -1 = L→R (start at -X, drive to +X).
+    // Re-rolled per car each time it completes a cycle so direction stays
+    // unpredictable across passes.
+    @State private var carDirections: [Float] = []
+    @State private var carCycleIndices: [Int] = []
+    // Tick at which the current run started (captured when `bodyModel.runStartTime`
+    // transitions to a new value). Car motion uses `(updateTick - runStartTick)
+    // * 0.1` so cars restart from phase 0 on each new run.
+    @State private var runStartTick: Int = 0
+    // Last runStartTime we observed; used to detect new-run transitions.
+    @State private var observedRunStartTime: CFTimeInterval? = nil
     @State private var userStartPosition: SIMD3<Float>?
 
     private let logger = Logger(subsystem: "flavinlab.CrossWalk-Tokyo", category: "WorldTracking")
@@ -52,26 +78,98 @@ struct ImmersiveView: View {
                 content.add(head)
                 self.headAnchor = head
 
-                // Head-anchored text
-                let initialText = "Loading coordinate..."
-                let initialMesh = MeshResource.generateText(
-                    initialText,
+                // Head-anchored COLLIDED warning. Hidden by default; toggled on
+                // whenever `bodyModel.lastCollisionTime` is within the display
+                // window (see updateWorldTrackingAndEntities + RealityView
+                // update: closure).
+                let collisionMesh = MeshResource.generateText(
+                    "COLLIDED",
                     extrusionDepth: 0.001,
-                    font: .systemFont(ofSize: 0.03, weight: .semibold),
+                    font: .systemFont(ofSize: 0.06, weight: .bold),
                     containerFrame: .zero,
                     alignment: .center,
                     lineBreakMode: .byTruncatingTail
                 )
-                let initialMaterial = UnlitMaterial(color: .white)
-                let textEntity = ModelEntity(mesh: initialMesh, materials: [initialMaterial])
-                textEntity.name = "HeadWorldText"
-                textEntity.position = SIMD3<Float>(0, 0.05, -0.7)
-                textEntity.scale = SIMD3<Float>(repeating: 1.0)
-                head.addChild(textEntity)
-
+                let collisionEntity = ModelEntity(
+                    mesh: collisionMesh,
+                    materials: [UnlitMaterial(color: .systemRed)]
+                )
+                collisionEntity.name = "HeadCollisionText"
+                collisionEntity.position = SIMD3<Float>(0, 0.05, -0.7)
+                collisionEntity.isEnabled = false
+                head.addChild(collisionEntity)
                 DispatchQueue.main.async {
-                    self.headTextEntity = textEntity
-                    self.lastHeadText = initialText
+                    self.headCollisionTextEntity = collisionEntity
+                }
+
+                // Head-anchored VICTORY! text, green, same placement as COLLIDED
+                // but mutually exclusive visually (different event, different
+                // timestamp). Hidden by default; toggled via isEnabled while
+                // `bodyModel.lastVictoryTime` is within the display window.
+                let victoryMesh = MeshResource.generateText(
+                    "VICTORY!",
+                    extrusionDepth: 0.001,
+                    font: .systemFont(ofSize: 0.06, weight: .bold),
+                    containerFrame: .zero,
+                    alignment: .center,
+                    lineBreakMode: .byTruncatingTail
+                )
+                let victoryEntity = ModelEntity(
+                    mesh: victoryMesh,
+                    materials: [UnlitMaterial(color: .systemGreen)]
+                )
+                victoryEntity.name = "HeadVictoryText"
+                victoryEntity.position = SIMD3<Float>(0, 0.05, -0.7)
+                victoryEntity.isEnabled = false
+                head.addChild(victoryEntity)
+                DispatchQueue.main.async {
+                    self.headVictoryTextEntity = victoryEntity
+                }
+
+                // Head-anchored stats line (Time + Cars hit). Mesh is
+                // regenerated per-victory in the RealityView update closure
+                // once real values are available; start with a placeholder.
+                let victoryStatsEntity = ModelEntity(
+                    mesh: MeshResource.generateText(
+                        " ",
+                        extrusionDepth: 0.001,
+                        font: .systemFont(ofSize: 0.03, weight: .medium),
+                        containerFrame: .zero,
+                        alignment: .center,
+                        lineBreakMode: .byTruncatingTail
+                    ),
+                    materials: [UnlitMaterial(color: .white)]
+                )
+                victoryStatsEntity.name = "HeadVictoryStats"
+                // Sit just below VICTORY! in head-anchor space.
+                victoryStatsEntity.position = SIMD3<Float>(0, -0.02, -0.7)
+                victoryStatsEntity.isEnabled = false
+                head.addChild(victoryStatsEntity)
+                DispatchQueue.main.async {
+                    self.headVictoryStatsEntity = victoryStatsEntity
+                }
+
+                // Head-anchored live run timer. Sits above COLLIDED/VICTORY!
+                // in head-anchor space so it remains readable while either
+                // banner is shown. Mesh is rewritten every 10Hz tick while
+                // `isRunActive`, and hidden otherwise.
+                let runTimerEntity = ModelEntity(
+                    mesh: MeshResource.generateText(
+                        "0.00s",
+                        extrusionDepth: 0.001,
+                        font: .systemFont(ofSize: 0.04, weight: .bold),
+                        containerFrame: .zero,
+                        alignment: .center,
+                        lineBreakMode: .byTruncatingTail
+                    ),
+                    materials: [UnlitMaterial(color: .white)]
+                )
+                runTimerEntity.name = "HeadRunTimer"
+                runTimerEntity.position = SIMD3<Float>(0, 0.13, -0.7)
+                runTimerEntity.isEnabled = false
+                head.addChild(runTimerEntity)
+                DispatchQueue.main.async {
+                    self.headRunTimerEntity = runTimerEntity
                 }
 
                 // Add body tracking content entity to scene
@@ -104,51 +202,108 @@ struct ImmersiveView: View {
                         crossTokyoEntity.position.y = 5.95
                         rootAnchor.addChild(crossTokyoEntity)
 
-                        // Spawn obstacle cube with collision shapes
-                        let spawnCube = try await Entity.load(named: "Cube")
-                        spawnCube.name = "SpawnCube"
-                        spawnCube.scale = SIMD3<Float>(1.5, 10.2, 1.5)
-                        spawnCube.position = SIMD3<Float>(0, 0.85, -2.0)
+                        // Cars: 5 lanes. Each car is a *cube* (invisible) that
+                        // owns the collision + physics body — the same setup that
+                        // worked when the cube was the visible obstacle — with a
+                        // ToyCar.usdz model parented underneath as the visible
+                        // mesh. Visual is uniform-scaled and yawed so its long
+                        // axis aligns with the road (world X = direction of travel).
+                        let carCount = 5
+                        // Realistic car hitbox in world meters (X = length along
+                        // travel, Y = height, Z = width). The previous 7×1.8×5 m
+                        // box was so wide that the body trigger sphere overlapped
+                        // it from ~3.5 m away regardless of the sphere's radius —
+                        // making `bodyCollisionRadius` effectively irrelevant.
+                        let carHitboxSize = SIMD3<Float>(2.0, 1.5, 1.0)
+                        for i in 0..<carCount {
+                            // Invisible collision body sized to a real car.
+                            let cube = try await Entity.load(named: "Cube")
+                            cube.name = "CarCube_\(i)"
+                            // Keep parent at unit scale so child orientations and
+                            // hitbox dimensions are not stretched non-uniformly.
+                            cube.scale = SIMD3<Float>(repeating: 1)
+                            let laneZ: Float = -bodyModel.carDistance * Float(i + 1)
+                            cube.position = SIMD3<Float>(8.0, 0.65, laneZ)
+                            // Explicit CollisionComponent on the ROOT entity so
+                            // CollisionEvents.{Began,Ended} fire with entityA/B ==
+                            // `cube` itself (name "CarCube_i"). With cube.scale = 1,
+                            // localExtents == world extents.
+                            self.installObstacleCollision(on: cube, localExtents: carHitboxSize)
+                            // Hide the cube via a fully transparent material;
+                            // collision component remains active.
+                            if let modelEntity = cube as? ModelEntity,
+                               var mc = modelEntity.components[ModelComponent.self] as? ModelComponent {
+                                mc.materials = [UnlitMaterial(color: .clear)]
+                                modelEntity.components[ModelComponent.self] = mc
+                            }
 
-                        // Generate collision shapes and assign to obstacle group
-                        spawnCube.generateCollisionShapes(recursive: true)
-                        self.applyObstacleCollisionGroup(to: spawnCube)
+                            // Visible toy car — child of the cube so it inherits
+                            // every per-frame position update automatically.
+                            // Uniform fit inside the hitbox; cube parent is now at
+                            // unit scale so no per-axis compensation is needed.
+                            let toy = try await Entity.load(named: "ToyCar")
+                            let nativeExtents = toy.visualBounds(relativeTo: nil).extents
+                            let safeExtents = SIMD3<Float>(
+                                max(nativeExtents.x, 1e-4),
+                                max(nativeExtents.y, 1e-4),
+                                max(nativeExtents.z, 1e-4)
+                            )
+                            let fitWorld = min(
+                                carHitboxSize.x / safeExtents.x,
+                                carHitboxSize.y / safeExtents.y,
+                                carHitboxSize.z / safeExtents.z
+                            )
+                            toy.scale = SIMD3<Float>(repeating: fitWorld)
+                            // Yaw 90° around Y so the model's long axis aligns
+                            // with world X (direction of travel).
+                            toy.orientation = simd_quatf(angle: .pi / 2,
+                                                         axis: SIMD3<Float>(0, 1, 0))
+                            cube.addChild(toy)
+                            self.toyEntities.append(toy)
+                            // All cars share one toy model + hitbox, so the fit
+                            // scale is identical across iterations; latest write wins.
+                            self.baseToyFitScale = fitWorld
 
-                        // SpawnCube moves, so it needs kinematic physics
-                        spawnCube.components.set(PhysicsBodyComponent(
-                            shapes: [.generateBox(width: 1.5, height: 10.2, depth: 1.5)],
-                            mass: 0,
-                            mode: .kinematic
-                        ))
-
-                        if let modelEntity = spawnCube as? ModelEntity,
-                           var mc = modelEntity.components[ModelComponent.self] as? ModelComponent {
-                            mc.materials = [SimpleMaterial(color: .blue, isMetallic: false)]
-                            modelEntity.components[ModelComponent.self] = mc
+                            // Hidden until the user presses Start — the timer
+                            // block enables cars on each new run.
+                            cube.isEnabled = false
+                            rootAnchor.addChild(cube)
+                            self.carEntities.append(cube)
+                            self.carDirections.append(Bool.random() ? 1.0 : -1.0)
+                            self.carCycleIndices.append(0)
                         }
 
-                        rootAnchor.addChild(spawnCube)
-                        self.targetCubeEntity = spawnCube
-
-                        // Car: wide obstacle that drives R→L perpendicular to the user's starting forward.
-                        let car = try await Entity.load(named: "Cube")
-                        car.name = "CarCube"
-                        car.scale = SIMD3<Float>(4.0, 1.8, 2.0)
-                        car.position = SIMD3<Float>(8.0, 0.9, -2.0)
-                        car.generateCollisionShapes(recursive: true)
-                        self.applyObstacleCollisionGroup(to: car)
-                        car.components.set(PhysicsBodyComponent(
-                            shapes: [.generateBox(width: 4.0, height: 1.8, depth: 2.0)],
-                            mass: 0,
-                            mode: .kinematic
-                        ))
-                        if let modelEntity = car as? ModelEntity,
+                        // Stationary obstacle (test): a fixed green pillar offset from
+                        // the wandering cube and car path so collisions can be probed
+                        // against a known, non-moving target.
+                        let stationaryObstacle = try await Entity.load(named: "Cube")
+                        stationaryObstacle.name = "StationaryObstacle"
+                        stationaryObstacle.scale = SIMD3<Float>(1.0, 4.0, 1.0)
+                        stationaryObstacle.position = SIMD3<Float>(0.0, 0.85, 3.5)
+                        self.installObstacleCollision(on: stationaryObstacle, localExtents: SIMD3<Float>(1, 1, 1))
+                        if let modelEntity = stationaryObstacle as? ModelEntity,
                            var mc = modelEntity.components[ModelComponent.self] as? ModelComponent {
-                            mc.materials = [SimpleMaterial(color: .red, isMetallic: false)]
+                            mc.materials = [SimpleMaterial(color: .green, isMetallic: false)]
                             modelEntity.components[ModelComponent.self] = mc
                         }
-                        rootAnchor.addChild(car)
-                        self.carEntity = car
+                        rootAnchor.addChild(stationaryObstacle)
+
+                        // Victory goal: green wall positioned one lane-spacing
+                        // past the final lane. Its name contains "Victory" so
+                        // BodyTrackingModel.updateMotorsByProximity triggers
+                        // `lastVictoryTime` on contact (and skips motor buzz).
+                        let victoryGoal = try await Entity.load(named: "Cube")
+                        victoryGoal.name = "VictoryGoal"
+                        victoryGoal.scale = SIMD3<Float>(4.0, 2.0, 1.0)
+                        let victoryZ: Float = -bodyModel.carDistance * Float(carCount + 1)
+                        victoryGoal.position = SIMD3<Float>(0.0, 1.0, victoryZ)
+                        self.installObstacleCollision(on: victoryGoal, localExtents: SIMD3<Float>(1, 1, 1))
+                        if let modelEntity = victoryGoal as? ModelEntity,
+                           var mc = modelEntity.components[ModelComponent.self] as? ModelComponent {
+                            mc.materials = [SimpleMaterial(color: .green, isMetallic: false)]
+                            modelEntity.components[ModelComponent.self] = mc
+                        }
+                        rootAnchor.addChild(victoryGoal)
 
                         // Directional light
                         let lightEntity = Entity()
@@ -165,56 +320,193 @@ struct ImmersiveView: View {
                 }
             } update: { content in
                 bodyModel.attachToSceneIfReady()
+                // Reactively toggle head-anchored COLLIDED + VICTORY! texts.
+                // Reading `lastCollisionTime` / `lastVictoryTime` establishes
+                // @Observable dependencies, so this closure re-fires the
+                // instant `updateMotorsByProximity` bumps either timestamp —
+                // no 10Hz timer round-trip needed.
+                let now = CACurrentMediaTime()
+                if let collisionText = headCollisionTextEntity {
+                    let isColliding = now - bodyModel.lastCollisionTime
+                        < bodyModel.collisionDisplayDuration
+                    if collisionText.isEnabled != isColliding {
+                        collisionText.isEnabled = isColliding
+                    }
+                }
+                if let victoryText = headVictoryTextEntity {
+                    let isVictory = now - bodyModel.lastVictoryTime
+                        < bodyModel.victoryDisplayDuration
+                    if victoryText.isEnabled != isVictory {
+                        victoryText.isEnabled = isVictory
+                    }
+                    // Stats line: rebuild mesh on each new victory (rising
+                    // edge of `lastVictoryTime`) so it shows that run's final
+                    // duration + hit ratio; toggle visibility in lockstep.
+                    if let statsText = headVictoryStatsEntity {
+                        if isVictory, bodyModel.lastVictoryTime > lastRenderedVictoryTime {
+                            lastRenderedVictoryTime = bodyModel.lastVictoryTime
+                            let duration = bodyModel.runDuration ?? 0
+                            let hits = bodyModel.carsHitInstanceIDs.count
+                            let total = bodyModel.totalCarsSpawned
+                            let pct = bodyModel.collisionRatio * 100
+                            let line = String(
+                                format: "Time %.2fs   Cars hit %d / %d (%.0f%%)",
+                                duration, hits, total, pct
+                            )
+                            statsText.model?.mesh = MeshResource.generateText(
+                                line,
+                                extrusionDepth: 0.001,
+                                font: .systemFont(ofSize: 0.03, weight: .medium),
+                                containerFrame: .zero,
+                                alignment: .center,
+                                lineBreakMode: .byTruncatingTail
+                            )
+                        }
+                        if statsText.isEnabled != isVictory {
+                            statsText.isEnabled = isVictory
+                        }
+                    }
+                }
             }
             .ignoresSafeArea()
 
-            // Face-fixed world-coordinate HUD
-            VStack(spacing: 4) {
-                Text("My World Coordinate")
-                    .font(.caption).bold()
-                Text(String(format: "x: %.3f  y: %.3f  z: %.3f", guiWorldPosition.x, guiWorldPosition.y, guiWorldPosition.z))
-                    .font(.caption2)
-                    .monospacedDigit()
+            // HUD: only shows transient COLLIDED during a run and a persistent
+            // result panel (VICTORY! + time + hit ratio) once the run ends.
+            VStack(spacing: 8) {
+                // Read `updateTick` so SwiftUI re-evaluates this VStack on
+                // every 10Hz timer tick. Without it, the `if now - last < 5`
+                // check only runs when `lastCollisionTime` is *written* — so
+                // COLLIDED would appear but never time out.
+                let _ = updateTick
+                // Transient COLLIDED banner during active contact. Visible
+                // for `collisionDisplayDuration` after the most recent
+                // write to `lastCollisionTime`.
+                if CACurrentMediaTime() - bodyModel.lastCollisionTime < bodyModel.collisionDisplayDuration {
+                    Text("COLLIDED")
+                        .font(.title3).bold()
+                        .foregroundStyle(.red)
+                        .padding(.horizontal, 16)
+                        .padding(.vertical, 8)
+                        .background(.black.opacity(0.75), in: RoundedRectangle(cornerRadius: 10))
+                }
 
-                Text(String(format: "yaw: %.1f  pitch: %.1f  roll: %.1f", guiOrientationDegrees.x, guiOrientationDegrees.y, guiOrientationDegrees.z))
-                    .font(.caption2)
-                    .monospacedDigit()
+                // Post-run result panel: VICTORY! + elapsed time + hit ratio.
+                // Persists from the moment `runEndTime` is set until the
+                // next `startRun()` call.
+                if let duration = bodyModel.runDuration {
+                    VStack(spacing: 4) {
+                        Text("VICTORY!")
+                            .font(.largeTitle).bold()
+                            .foregroundStyle(.green)
+                        Text(String(format: "Time: %.2fs", duration))
+                            .font(.title3)
+                            .foregroundStyle(.white)
+                            .monospacedDigit()
+                        Text(String(
+                            format: "Cars hit: %d / %d (%.0f%%)",
+                            bodyModel.carsHitInstanceIDs.count,
+                            bodyModel.totalCarsSpawned,
+                            bodyModel.collisionRatio * 100
+                        ))
+                        .font(.body)
+                        .foregroundStyle(.white)
+                        .monospacedDigit()
+                    }
+                    .padding(.horizontal, 20)
+                    .padding(.vertical, 12)
+                    .background(.black.opacity(0.8), in: RoundedRectangle(cornerRadius: 14))
+                }
             }
-            .padding(.horizontal, 12)
-            .padding(.vertical, 8)
-            .foregroundStyle(.white)
-            .background(.black.opacity(0.6), in: RoundedRectangle(cornerRadius: 10))
             .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
             .padding(.top, 18)
         }
         .ignoresSafeArea()
-        // 10Hz timer for cube wandering and coordinate display
+        // 10Hz timer for car motion and coordinate display
         .onReceive(Timer.publish(every: 0.1, on: .main, in: .common).autoconnect()) { _ in
-            // Cube wandering
-            if let cube = targetCubeEntity {
-                let t = Float(updateTick) * 0.1
-                let wanderX = sin(t * 0.5) * 4.0 + cos(t * 0.3) * 2.0
-                let wanderZ = -3.0 + cos(t * 0.4) * 4.0 + sin(t * 0.2) * 2.0
-                cube.position = SIMD3<Float>(wanderX, 0.85, wanderZ)
+            // Cars: Frogger-style. Each car has its own Z-lane (spaced by
+            // bodyModel.carDistance), its own time-phase offset, AND a random
+            // direction (L→R or R→L) that re-rolls each time the car completes
+            // a cycle — so neither lane assignment nor pass count predicts
+            // which way the next car will come.
+            // Detect run start/end transitions so we can reset local car state
+            // and toggle entity visibility without polling.
+            if observedRunStartTime != bodyModel.runStartTime {
+                observedRunStartTime = bodyModel.runStartTime
+                if bodyModel.runStartTime != nil {
+                    // New run began. Reset phase origin and force first-tick
+                    // cycle advance on every car (= first-pass spawn count).
+                    runStartTick = updateTick
+                    for idx in carCycleIndices.indices {
+                        carCycleIndices[idx] = -1
+                    }
+                    for car in carEntities {
+                        car.isEnabled = true
+                    }
+                }
             }
-
-            // Car: drive from +X (user's right) to -X (user's left) at ~2 m/s.
-            // Track range is 16m; cycle is 8s driving + 1s hidden pause then respawn.
-            if let car = carEntity {
-                let carSpeed: Float = 2.0
-                let startX: Float = 8.0
-                let endX: Float = -8.0
-                let driveDistance = startX - endX
-                let driveDuration = driveDistance / carSpeed   // 8s
-                let cycleDuration: Float = driveDuration + 1.0 // 9s total
-                let t = Float(updateTick) * 0.1
-                let phase = t.truncatingRemainder(dividingBy: cycleDuration)
-                let carZ: Float = -2.0
-                if phase < driveDuration {
-                    car.position = SIMD3<Float>(startX - carSpeed * phase, 0.9, carZ)
-                } else {
-                    // Briefly park off-screen before the next pass.
-                    car.position = SIMD3<Float>(startX, 0.9, carZ)
+            if !bodyModel.isRunActive {
+                // Not started yet, or VICTORY reached — hide cars so they
+                // don't clutter the scene or trigger proximity contacts.
+                for car in carEntities where car.isEnabled {
+                    car.isEnabled = false
+                }
+            } else if !carEntities.isEmpty,
+                      carDirections.count == carEntities.count,
+                      carCycleIndices.count == carEntities.count {
+                let carSpeed: Float = max(bodyModel.carSpeed, 0.01)
+                let trackHalfWidth: Float = 8.0
+                let driveDistance: Float = trackHalfWidth * 2
+                let driveDuration = driveDistance / carSpeed
+                // No park — cars teleport to the opposite edge and immediately
+                // drive back. `cycleDuration == driveDuration`.
+                let cycleDuration: Float = driveDuration
+                // Time origin is the run's start tick, so cars restart from
+                // phase 0 on each new run rather than continuing from wherever
+                // the global updateTick happened to land.
+                let t = Float(updateTick - runStartTick) * 0.1
+                let phaseStride = cycleDuration / Float(carEntities.count)
+                for (i, car) in carEntities.enumerated() {
+                    let laneZ: Float = -bodyModel.carDistance * Float(i + 1)
+                    let totalT = t + Float(i) * phaseStride
+                    let cycleIndex = Int(totalT / cycleDuration)
+                    if cycleIndex != carCycleIndices[i] {
+                        carCycleIndices[i] = cycleIndex
+                        carDirections[i] = Bool.random() ? 1.0 : -1.0
+                        // Unique per-pass name so BodyTrackingModel can tally
+                        // distinct car contacts across cycles.
+                        car.name = "CarCube_\(i)_p\(cycleIndex)"
+                        bodyModel.recordCarSpawn()
+                    }
+                    let direction = carDirections[i]
+                    let startX = trackHalfWidth * direction
+                    let phase = totalT.truncatingRemainder(dividingBy: cycleDuration)
+                    car.position = SIMD3<Float>(
+                        startX - carSpeed * phase * direction,
+                        0.65,
+                        laneZ
+                    )
+                    // Flip the cube 180° around Y when driving R→L so the toy
+                    // car child (oriented to face +X) ends up facing -X with
+                    // the direction of travel. 180° leaves the axis-aligned
+                    // collision box unchanged (its X and Z extents are mirrored).
+                    car.orientation = simd_quatf(
+                        angle: direction == 1 ? .pi : 0,
+                        axis: SIMD3<Float>(0, 1, 0)
+                    )
+                    // Live size: cube parent scale drives the collision hitbox
+                    // (since the local box is in the cube's local space); the
+                    // toy child counter-scales to its own visualScale so the
+                    // two knobs are independent. Net world sizes:
+                    //   hitbox = baseHitboxSize  * carHitboxScale
+                    //   visual = baseToyFitScale * carVisualScale
+                    let hitboxScale = max(bodyModel.carHitboxScale, 0.01)
+                    let visualScale = max(bodyModel.carVisualScale, 0.01)
+                    car.scale = SIMD3<Float>(repeating: hitboxScale)
+                    if i < toyEntities.count {
+                        toyEntities[i].scale = SIMD3<Float>(
+                            repeating: baseToyFitScale * visualScale / hitboxScale
+                        )
+                    }
                 }
             }
 
@@ -255,7 +547,10 @@ struct ImmersiveView: View {
             await bodyModel.processHandUpdates()
         }
         .onDisappear {
-            headTextEntity = nil
+            headCollisionTextEntity = nil
+            headVictoryTextEntity = nil
+            headVictoryStatsEntity = nil
+            headRunTimerEntity = nil
             #if !targetEnvironment(simulator)
             if !isRunningInPreview {
                 bodyModel.session.stop()
@@ -267,70 +562,66 @@ struct ImmersiveView: View {
 
     // MARK: - Helpers
 
-    /// Recursively applies .obstacle collision group to entity and its children
-    private func applyObstacleCollisionGroup(to entity: Entity) {
-        if var collision = entity.components[CollisionComponent.self] as? CollisionComponent {
-            collision.filter = CollisionFilter(group: .obstacle, mask: .skeleton)
-            entity.components.set(collision)
-        }
-        for child in entity.children {
-            applyObstacleCollisionGroup(to: child)
-        }
+    /// Installs an `.obstacle` CollisionComponent on the *root* entity with a
+    /// unit-space box of `localExtents`. World-space size = `localExtents *
+    /// entity.scale`, so pass (1,1,1) for obstacles whose visible size comes
+    /// from their `.scale`. Guarantees that CollisionEvents fire with the
+    /// named root entity rather than an unnamed child mesh.
+    private func installObstacleCollision(on entity: Entity, localExtents: SIMD3<Float>) {
+        let shape = ShapeResource.generateBox(width: localExtents.x,
+                                              height: localExtents.y,
+                                              depth: localExtents.z)
+        var collision = CollisionComponent(shapes: [shape])
+        collision.filter = CollisionFilter(group: .obstacle, mask: .skeleton)
+        entity.components.set(collision)
     }
 
-    // MARK: - World Tracking Display
+    // MARK: - Head-Anchored Banner Toggles
 
+    /// 10 Hz fallback: also runs in the RealityView `update:` closure for
+    /// instant show on the rising edge. This loop ensures the hide transition
+    /// fires on time even when no observable state is churning.
     private func updateWorldTrackingAndEntities() {
-        guard let headEntity = headTextEntity else { return }
-
-        #if !targetEnvironment(simulator)
-        guard isWorldTrackingRunning, !isRunningInPreview else { return }
-        guard let deviceAnchor = bodyModel.worldTracking.queryDeviceAnchor(atTimestamp: CACurrentMediaTime()) else { return }
-
-        let transformMatrix = deviceAnchor.originFromAnchorTransform
-        let p = SIMD3<Float>(transformMatrix.columns.3.x, transformMatrix.columns.3.y, transformMatrix.columns.3.z)
-
-        let q = Transform(matrix: transformMatrix).rotation
-        let qw = q.real
-        let qx = q.imag.x
-        let qy = q.imag.y
-        let qz = q.imag.z
-
-        let sinrCosp = 2 * (qw * qx + qy * qz)
-        let cosrCosp = 1 - 2 * (qx * qx + qy * qy)
-        let roll = atan2(sinrCosp, cosrCosp)
-
-        let sinp = 2 * (qw * qy - qz * qx)
-        let pitch = abs(sinp) >= 1 ? (sinp >= 0 ? Float.pi / 2 : -Float.pi / 2) : asin(sinp)
-
-        let sinyCosp = 2 * (qw * qz + qx * qy)
-        let cosyCosp = 1 - 2 * (qy * qy + qz * qz)
-        let yaw = atan2(sinyCosp, cosyCosp)
-
-        let rad2deg: Float = 180 / .pi
-        let o = SIMD3<Float>(yaw * rad2deg, pitch * rad2deg, roll * rad2deg)
-
-        guiWorldPosition = p
-        guiOrientationDegrees = o
-
-        let newText = String(
-            format: "World Coordinate:\nX: %.3f  Y: %.3f  Z: %.3f\nYaw: %.1f  Pitch: %.1f  Roll: %.1f",
-            p.x, p.y, p.z, o.x, o.y, o.z
-        )
-
-        if newText != lastHeadText {
-            lastHeadText = newText
-            let mesh = MeshResource.generateText(
-                newText,
-                extrusionDepth: 0.001,
-                font: .systemFont(ofSize: 0.03, weight: .semibold),
-                containerFrame: .zero,
-                alignment: .center,
-                lineBreakMode: .byTruncatingTail
-            )
-            headEntity.model = ModelComponent(mesh: mesh, materials: [UnlitMaterial(color: .white)])
+        let now = CACurrentMediaTime()
+        if let collisionText = headCollisionTextEntity {
+            let isColliding = now - bodyModel.lastCollisionTime
+                < bodyModel.collisionDisplayDuration
+            if collisionText.isEnabled != isColliding {
+                collisionText.isEnabled = isColliding
+            }
         }
-        #endif
+        if let victoryText = headVictoryTextEntity {
+            let isVictory = now - bodyModel.lastVictoryTime
+                < bodyModel.victoryDisplayDuration
+            if victoryText.isEnabled != isVictory {
+                victoryText.isEnabled = isVictory
+            }
+            // Mirror stats visibility here so the hide transition is never
+            // missed even if the RealityView update closure idles.
+            if let statsText = headVictoryStatsEntity,
+               statsText.isEnabled != isVictory {
+                statsText.isEnabled = isVictory
+            }
+        }
+        // Live run timer: rewrite the mesh every tick while a run is in
+        // progress; hide once VICTORY freezes runEndTime (the final time
+        // is reported by `headVictoryStatsEntity`).
+        if let timerText = headRunTimerEntity {
+            if bodyModel.isRunActive, let start = bodyModel.runStartTime {
+                let elapsed = now - start
+                timerText.model?.mesh = MeshResource.generateText(
+                    String(format: "%.2fs", elapsed),
+                    extrusionDepth: 0.001,
+                    font: .systemFont(ofSize: 0.04, weight: .bold),
+                    containerFrame: .zero,
+                    alignment: .center,
+                    lineBreakMode: .byTruncatingTail
+                )
+                if !timerText.isEnabled { timerText.isEnabled = true }
+            } else if timerText.isEnabled {
+                timerText.isEnabled = false
+            }
+        }
     }
 }
 

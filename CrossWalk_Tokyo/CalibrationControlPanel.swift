@@ -31,6 +31,19 @@ struct CalibrationControlPanel: View {
                         model.startCalibration()
                     }
 
+                    // Start / Restart the car simulation run. Starts the timer
+                    // and begins counting spawned cars + distinct contacts;
+                    // pressing again mid-run or post-run resets all stats.
+                    ToggleButton(
+                        label: model.isRunActive ? "Restart Run" : "Start Run",
+                        isActive: true,
+                        activeColor: .blue,
+                        inactiveColor: .blue,
+                        systemImage: "play.fill"
+                    ) {
+                        model.startRun()
+                    }
+
                     Spacer()
                 }
 
@@ -161,28 +174,24 @@ struct ControlOverlayPanel: View {
 
                     Divider().background(.white.opacity(0.3))
 
-                    SectionHeader("Activation Trigger")
-                    StepperRow(label: "Width", value: $model.activationTriggerWidth, step: 0.1)
-                    StepperRow(label: "Height", value: $model.activationTriggerHeight, step: 0.1)
-                    StepperRow(label: "Depth", value: $model.activationTriggerDepth, step: 0.1)
+                    SectionHeader("Proximity Trigger")
+                    StepperRow(label: "Radius", value: $model.proximityTriggerRadius, step: 0.1)
 
-                    Divider().background(.white.opacity(0.3))
+                    SectionHeader("Body Collision Trigger")
+                    StepperRow(label: "Radius", value: $model.bodyCollisionRadius, step: 0.01)
 
-                    SectionHeader("Upper Arm Trigger")
-                    StepperRow(label: "Height", value: $model.upperArmTriggerHeight, step: 0.02)
-                    StepperRow(label: "Lateral", value: $model.upperArmTriggerLateral, step: 0.05)
+                    SectionHeader("Distance Buckets (m)")
+                    StepperRow(label: "Close Max", value: $model.distCloseMax, step: 0.05)
+                    StepperRow(label: "Med Max", value: $model.distMedMax, step: 0.05)
+                    StepperRow(label: "Far Max", value: $model.distFarMax, step: 0.05)
 
-                    SectionHeader("Forearm Trigger")
-                    StepperRow(label: "Height", value: $model.forearmTriggerHeight, step: 0.02)
-                    StepperRow(label: "Lateral", value: $model.forearmTriggerLateral, step: 0.05)
-
-                    SectionHeader("Thigh Trigger")
-                    StepperRow(label: "Height", value: $model.thighTriggerHeight, step: 0.02)
-                    StepperRow(label: "Lateral", value: $model.thighTriggerLateral, step: 0.05)
-
-                    SectionHeader("Shank Trigger")
-                    StepperRow(label: "Height", value: $model.shankTriggerHeight, step: 0.02)
-                    StepperRow(label: "Lateral", value: $model.shankTriggerLateral, step: 0.05)
+                    SectionHeader("Cars")
+                    StepperRow(label: "Speed (m/s)", value: $model.carSpeed, step: 0.5)
+                    StepperRow(label: "Distance (m)", value: $model.carDistance, step: 0.5)
+                    // Independent multipliers for the toy-car visual mesh and
+                    // the collision hitbox, so the two can be tuned separately.
+                    StepperRow(label: "Visual Size", value: $model.carVisualScale, step: 0.1)
+                    StepperRow(label: "Hitbox Size", value: $model.carHitboxScale, step: 0.1)
                 }
             }
             .frame(maxHeight: 500)

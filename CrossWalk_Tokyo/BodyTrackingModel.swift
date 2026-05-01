@@ -21,7 +21,8 @@ import Network
 // MARK: - Node ID to Body Segment Mapping
 
 // RPi relay address — all commands are sent here; RPi forwards to the correct node
-let rpiIP = "192.168.1.7"
+//let rpiIP = "192.168.1.7"
+let rpiIP = "172.20.10.7"
 
 // IMU node IDs (byte 0 of each packet) -> segment name
 let nodeIDToSegment: [String: String] = [
@@ -78,16 +79,15 @@ class BodyTrackingModel {
     nonisolated(unsafe) private var collisionEndedSubscription: (any Cancellable)?
     nonisolated(unsafe) private var skeletonTrackingSubscription: (any Cancellable)?
 
-    // MARK: - Collision State (per-segment, per-level collision tracking)
+    // MARK: - Collision & Motor State (algorithm 3: proximity trigger + distance math)
 
-    // Collision counts per motor segment per level: [segment: ["far": N, "med": N]]
-    private var motorLevelCollisionCounts: [String: [String: Int]] = {
-        var d: [String: [String: Int]] = [:]
-        for seg in activeSegments { d[seg] = ["far": 0, "med": 0] }
-        return d
-    }()
+    /// Obstacles currently inside the headset proximity trigger. Populated by
+    /// `CollisionEvents.Began/.Ended`. Each frame we compute per-limb distance
+    /// to each tracked obstacle, pick the nearest, and drive motors accordingly.
+    private var trackedObstacles: Set<Entity> = []
 
-    // Current motor command per segment (nil = OFF)
+    /// Most recently sent motor level per segment, used for UDP dedup.
+    /// nil = motor is OFF.
     private var motorCurrentLevel: [String: String?] = {
         var d: [String: String?] = [:]
         for seg in activeSegments { d[seg] = nil }
@@ -100,31 +100,117 @@ class BodyTrackingModel {
         return d
     }()
 
-    /// Returns the deepest active level for a segment ("med" > "far"), or nil if none active.
-    private func deepestActiveLevel(for segment: String) -> String? {
-        guard let levels = motorLevelCollisionCounts[segment] else { return nil }
-        if (levels["med"] ?? 0) > 0 { return "med" }
-        if (levels["far"] ?? 0) > 0 { return "far" }
-        return nil
-    }
-
     nonisolated(unsafe) private var motorOffDebounceTimers: [String: Timer] = [:]
     private let motorOffDebounceDelay: TimeInterval = 1.0
 
     private var lastSentCommand: [String: String] = [:]
 
-    // Upper/lower limb activation (independent — controlled by headset trigger volumes)
-    var areUpperLimbsActive: Bool = false
-    var areLowerLimbsActive: Bool = false
-    private var upperActivationCollisionCount: Int = 0
-    private var lowerActivationCollisionCount: Int = 0
+    // Headset-anchored proximity trigger (sphere). Obstacles entering it get
+    // added to `trackedObstacles`; per-frame distance math maps them to limbs.
+    private var proximityTrigger: Entity?
+    var proximityTriggerRadius: Float = 3.0 { didSet { geometryNeedsRefresh = true } }
 
-    // Headset activation trigger volume entities (box prisms that follow headset)
-    private var upperActivationTrigger: Entity?
-    private var lowerActivationTrigger: Entity?
-    var activationTriggerWidth: Float = 2.0 { didSet { geometryNeedsRefresh = true } }
-    var activationTriggerHeight: Float = 1.0 { didSet { geometryNeedsRefresh = true } }
-    var activationTriggerDepth: Float = 2.0 { didSet { geometryNeedsRefresh = true } }
+    // Body-sized trigger, also headset-anchored, sized to the user's
+    // shoulder radius. A CollisionEvents.Began on this trigger is the source
+    // of truth for COLLIDED / VICTORY — no per-limb distance math needed, so
+    // torso and head contacts register even when the arms aren't extended.
+    private var bodyCollisionTrigger: Entity?
+    // Sphere radius in meters. Default ~half a shoulder width (≈0.45m across).
+    var bodyCollisionRadius: Float = 0.10 { didSet { geometryNeedsRefresh = true } }
+
+    // Proximity visualizers: per-limb sphere at the closest obstacle surface
+    // point + thin cylinder from limb midpoint to that point. Color-coded by
+    // distance bucket (red/yellow/blue). Hidden when a limb is out of range.
+    var showProximityVisualizers: Bool = true
+    private var closestPointMarkers: [HandTrackingManager.IMUBodySegment: ModelEntity] = [:]
+    private var distanceConnectors: [HandTrackingManager.IMUBodySegment: ModelEntity] = [:]
+    private let connectorBaseHeight: Float = 1.0
+
+    // Distance buckets (meters). Distance is from a limb midpoint to the closest
+    // point on an obstacle's AABB.
+    //   CLOSE = [0, distCloseMax)
+    //   MED   = [distCloseMax, distMedMax)
+    //   FAR   = [distMedMax, distFarMax]
+    //   OFF   > distFarMax
+    var distCloseMax: Float = 0.5
+    var distMedMax: Float = 1.0
+    var distFarMax: Float = 2.0
+
+    // Test obstacle tunables (read live by the ImmersiveView car update loop).
+    // carSpeed: m/s the cars travel along the R→L track.
+    // carDistance: forward distance (meters) from the user origin to the car lane;
+    //   stored as a positive value, applied as -Z in world space.
+    var carSpeed: Float = 3.0
+    var carDistance: Float = 2.0
+    // Independent multipliers for the car hitbox (collision shape) and the
+    // toy-car visual mesh. Default 1.0 each. Read live by the ImmersiveView
+    // timer so panel changes apply immediately without restarting the run.
+    var carVisualScale: Float = 2.5
+    var carHitboxScale: Float = 0.9
+
+    // Limbs that may receive vibrotactile feedback. Per obstacle, only the single
+    // closest limb in this set vibrates — preventing both arms (etc.) from firing
+    // on the same nearby object. Scale by adding more `IMUBodySegment` cases.
+    private let motorEligibleLimbs: Set<HandTrackingManager.IMUBodySegment> = [
+        .leftUpperArm, .rightUpperArm
+    ]
+
+    // Collision display. `lastCollisionTime` / `lastVictoryTime` are bumped
+    // by `registerBodyContact` whenever the shoulder-width body trigger
+    // overlaps an obstacle. The UI shows the banner for
+    // `collisionDisplayDuration` seconds after each bump.
+    let collisionDisplayDuration: CFTimeInterval = 5.0
+    var lastCollisionTime: CFTimeInterval = -.infinity
+    let victoryDisplayDuration: CFTimeInterval = 5.0
+    var lastVictoryTime: CFTimeInterval = -.infinity
+
+    // Run lifecycle + stats. `runStartTime == nil` before the user has pressed
+    // START; `runEndTime != nil` once VICTORY has fired. `isRunActive` is
+    // true only between those two events — during which time the cars move,
+    // spawn counting accumulates, and contacts are tallied.
+    var runStartTime: CFTimeInterval? = nil
+    var runEndTime: CFTimeInterval? = nil
+    var totalCarsSpawned: Int = 0
+    // Per-pass car IDs. The caller (ImmersiveView) renames each car as
+    // "CarCube_<lane>_p<passIndex>" on cycle rollovers so each pass is a
+    // distinct key here, even though the underlying entity is reused.
+    var carsHitInstanceIDs: Set<String> = []
+
+    var isRunActive: Bool {
+        runStartTime != nil && runEndTime == nil
+    }
+    var runDuration: CFTimeInterval? {
+        guard let s = runStartTime, let e = runEndTime else { return nil }
+        return e - s
+    }
+    var collisionRatio: Double {
+        guard totalCarsSpawned > 0 else { return 0 }
+        return Double(carsHitInstanceIDs.count) / Double(totalCarsSpawned)
+    }
+
+    func startRun() {
+        runStartTime = CACurrentMediaTime()
+        runEndTime = nil
+        totalCarsSpawned = 0
+        carsHitInstanceIDs.removeAll()
+        lastCollisionTime = -.infinity
+        lastVictoryTime = -.infinity
+    }
+
+    func recordCarSpawn() {
+        guard isRunActive else { return }
+        totalCarsSpawned += 1
+    }
+
+    func recordCarContact(_ instanceID: String) {
+        guard isRunActive else { return }
+        carsHitInstanceIDs.insert(instanceID)
+    }
+
+    func recordVictory() {
+        guard isRunActive else { return }
+        runEndTime = CACurrentMediaTime()
+    }
 
     private var imuStreamingSegments: Set<String> = []
 
@@ -155,7 +241,7 @@ class BodyTrackingModel {
 
     var skeletonForwardOffset: Float = -0.05
     var shoulderVerticalOffset: Float = -0.20
-    var shoulderLateralOffset: Float = 0.15
+    var shoulderLateralOffset: Float = 0.25
     var hipVerticalOffset: Float = -0.70
     var hipLateralOffset: Float = 0.10
 
@@ -174,15 +260,6 @@ class BodyTrackingModel {
     var thighRadius: Float = 0.10 { didSet { geometryNeedsRefresh = true } }
     var shankLength: Float = 0.17 { didSet { geometryNeedsRefresh = true } }
     var shankRadius: Float = 0.10 { didSet { geometryNeedsRefresh = true } }
-
-    var upperArmTriggerHeight: Float = 0.28 { didSet { geometryNeedsRefresh = true } }
-    var upperArmTriggerLateral: Float = 0.50 { didSet { geometryNeedsRefresh = true } }
-    var forearmTriggerHeight: Float = 0.25 { didSet { geometryNeedsRefresh = true } }
-    var forearmTriggerLateral: Float = 0.50 { didSet { geometryNeedsRefresh = true } }
-    var thighTriggerHeight: Float = 0.45 { didSet { geometryNeedsRefresh = true } }
-    var thighTriggerLateral: Float = 0.50 { didSet { geometryNeedsRefresh = true } }
-    var shankTriggerHeight: Float = 0.17 { didSet { geometryNeedsRefresh = true } }
-    var shankTriggerLateral: Float = 0.50 { didSet { geometryNeedsRefresh = true } }
 
     // MARK: - IMU Calibration (Two-Pose, SlimeVR-style left/right split)
     //
@@ -224,11 +301,6 @@ class BodyTrackingModel {
     // packet refreshes lastParentOrientations and then the forearm is re-dispatched
     // with a time-mismatched (fresh parent, stale child) pair.
     private var lastDispatchedRaw: [String: simd_quatf] = [:]
-
-    // Single-fire latch: snapshot+stop runs at most once per inactive period.
-    private var hasStoppedLimbsThisSession: Bool = false
-    private let limbStopDebounceSeconds: UInt64 = 2
-    private var pendingLimbStopTask: Task<Void, Never>?
 
     private var lastQuatLogTime: [String: CFTimeInterval] = [:]
     private var lastIMUOrientations: [String: simd_quatf] = [:]
@@ -277,31 +349,54 @@ class BodyTrackingModel {
 
         setupIMUOrientationSubscription()
 
-        // All limbs start hidden; shown when activation triggers fire or calibration starts.
+        // All limbs start hidden; shown after calibration completes.
         handManager.setAllLimbsActive(false)
 
-        // Create headset activation trigger volumes (upper + lower body).
-        let boxShape = ShapeResource.generateBox(
-            width: activationTriggerWidth,
-            height: activationTriggerHeight,
-            depth: activationTriggerDepth
-        )
+        // One headset-anchored sphere proximity trigger. Obstacles entering it
+        // get tracked; per-frame distance math handles per-limb motor output.
+        let sphere = ShapeResource.generateSphere(radius: proximityTriggerRadius)
+        let proximity = TriggerVolume(shape: sphere)
+        proximity.name = "headsetProximityTrigger"
+        var proximityCollision = proximity.collision ?? CollisionComponent(shapes: [sphere])
+        proximityCollision.filter = CollisionFilter(group: .skeleton, mask: .obstacle)
+        proximity.components.set(proximityCollision)
+        contentEntity.addChild(proximity)
+        proximityTrigger = proximity
 
-        let upper = TriggerVolume(shape: boxShape)
-        upper.name = "headsetActivationTrigger_upper"
-        var upperCollision = upper.collision ?? CollisionComponent(shapes: [boxShape])
-        upperCollision.filter = CollisionFilter(group: .skeleton, mask: .obstacle)
-        upper.components.set(upperCollision)
-        contentEntity.addChild(upper)
-        upperActivationTrigger = upper
+        // Shoulder-width body trigger, concentric with the proximity sphere
+        // but small enough to represent the user's actual silhouette. Its
+        // Began event is treated as direct physical contact (COLLIDED or
+        // VICTORY), so detection never depends on limb-tip math.
+        let bodyShape = ShapeResource.generateSphere(radius: bodyCollisionRadius)
+        let body = TriggerVolume(shape: bodyShape)
+        body.name = "bodyCollisionTrigger"
+        var bodyCollision = body.collision ?? CollisionComponent(shapes: [bodyShape])
+        bodyCollision.filter = CollisionFilter(group: .skeleton, mask: .obstacle)
+        body.components.set(bodyCollision)
+        contentEntity.addChild(body)
+        bodyCollisionTrigger = body
 
-        let lower = TriggerVolume(shape: boxShape)
-        lower.name = "headsetActivationTrigger_lower"
-        var lowerCollision = lower.collision ?? CollisionComponent(shapes: [boxShape])
-        lowerCollision.filter = CollisionFilter(group: .skeleton, mask: .obstacle)
-        lower.components.set(lowerCollision)
-        contentEntity.addChild(lower)
-        lowerActivationTrigger = lower
+        // One visualizer pair (marker sphere + thin connector cylinder) per limb.
+        // Hidden at startup; shown once calibration + proximity tracking are active.
+        for imuSeg in HandTrackingManager.IMUBodySegment.allCases {
+            let marker = ModelEntity(
+                mesh: .generateSphere(radius: 0.04),
+                materials: [UnlitMaterial(color: .white)]
+            )
+            marker.name = "closestPointMarker_\(imuSeg.rawValue)"
+            marker.isEnabled = false
+            contentEntity.addChild(marker)
+            closestPointMarkers[imuSeg] = marker
+
+            let connector = ModelEntity(
+                mesh: .generateCylinder(height: connectorBaseHeight, radius: 0.006),
+                materials: [UnlitMaterial(color: .white)]
+            )
+            connector.name = "distanceConnector_\(imuSeg.rawValue)"
+            connector.isEnabled = false
+            contentEntity.addChild(connector)
+            distanceConnectors[imuSeg] = connector
+        }
 
         return contentEntity
     }
@@ -338,19 +433,15 @@ class BodyTrackingModel {
                     hipLateralOffset: self.hipLateralOffset
                 )
 
-                // Move activation triggers to follow the headset, yaw-only orientation.
+                // Keep the proximity trigger centered on the headset. Sphere is
+                // rotationally symmetric so no orientation update needed.
                 let headPos = SIMD3<Float>(cameraTransform.columns.3.x, cameraTransform.columns.3.y, cameraTransform.columns.3.z)
-                self.upperActivationTrigger?.position = headPos + SIMD3<Float>(0, self.shoulderVerticalOffset, 0)
-                self.lowerActivationTrigger?.position = headPos + SIMD3<Float>(0, self.hipVerticalOffset, 0)
-                let fullQ = simd_quatf(cameraTransform)
-                let fwd = simd_act(fullQ, SIMD3<Float>(0, 0, -1))
-                let yaw = atan2(fwd.x, fwd.z)
-                let yawOnlyQ = simd_quatf(angle: yaw, axis: SIMD3<Float>(0, 1, 0))
-                self.upperActivationTrigger?.orientation = yawOnlyQ
-                self.lowerActivationTrigger?.orientation = yawOnlyQ
-
-                // Keep segment trigger volumes world-axis-aligned.
-                self.handManager.resetTriggerOrientations()
+                self.proximityTrigger?.position = headPos
+                // Anchor the body trigger ~40 cm below the head — roughly chest
+                // level — so a small (e.g. 25 cm) sphere centered there actually
+                // intersects a real car's hitbox (which sits below head height)
+                // instead of floating above it.
+                self.bodyCollisionTrigger?.position = SIMD3<Float>(headPos.x, headPos.y - 0.4, headPos.z)
 
                 if self.geometryNeedsRefresh {
                     self.geometryNeedsRefresh = false
@@ -358,15 +449,16 @@ class BodyTrackingModel {
                         upperArmLength: self.upperArmLength, upperArmRadius: self.upperArmRadius,
                         forearmLength: self.forearmLength, forearmRadius: self.forearmRadius,
                         thighLength: self.thighLength, thighRadius: self.thighRadius,
-                        shankLength: self.shankLength, shankRadius: self.shankRadius,
-                        uaTrigH: self.upperArmTriggerHeight, uaTrigLat: self.upperArmTriggerLateral,
-                        faTrigH: self.forearmTriggerHeight, faTrigLat: self.forearmTriggerLateral,
-                        thTrigH: self.thighTriggerHeight, thTrigLat: self.thighTriggerLateral,
-                        shTrigH: self.shankTriggerHeight, shTrigLat: self.shankTriggerLateral
+                        shankLength: self.shankLength, shankRadius: self.shankRadius
                     )
-                    self.refreshActivationTriggers()
+                    self.refreshProximityTrigger()
+                    self.refreshBodyCollisionTrigger()
                 }
             }
+
+            // Per-frame: recompute per-limb min distance to each tracked obstacle,
+            // quantize to {close, med, far, off}, and send motor commands.
+            self.updateMotorsByProximity()
 
             // Chest yaw: SLERP toward target each frame for smooth rotation.
             if self.hasChestYawTarget {
@@ -675,9 +767,8 @@ class BodyTrackingModel {
             }
         }
 
-        // Reset collision/motor state.
+        // Reset motor state. Proximity tracking is independent of calibration.
         for seg in activeSegments {
-            motorLevelCollisionCounts[seg] = ["far": 0, "med": 0]
             motorCurrentLevel[seg] = nil
             motorIsOn[seg] = false
         }
@@ -686,8 +777,6 @@ class BodyTrackingModel {
 
         // Show all skeletons after calibration and start all limb IMUs.
         handManager.setAllLimbsActive(true)
-        areUpperLimbsActive = true
-        areLowerLimbsActive = true
         for seg in activeSegments where seg != chestSegment {
             if let nodeID = segmentToNodeID[seg] {
                 lastSentCommand.removeValue(forKey: "\(nodeID)_imu")
@@ -720,9 +809,6 @@ class BodyTrackingModel {
         pose2IMUData.removeAll()
         rawBeforeStop.removeAll()
         pendingYawResync.removeAll()
-        hasStoppedLimbsThisSession = false
-        pendingLimbStopTask?.cancel()
-        pendingLimbStopTask = nil
         lastDispatchedRaw.removeAll()
         handManager.resetParentOrientations()
         hasChestYawTarget = false
@@ -749,18 +835,14 @@ class BodyTrackingModel {
                 sendMotorCommand(segment: seg, on: false)
             }
             motorIsOn[seg] = false
-            motorLevelCollisionCounts[seg] = ["far": 0, "med": 0]
             motorCurrentLevel[seg] = nil
         }
         for (_, timer) in motorOffDebounceTimers { timer.invalidate() }
         motorOffDebounceTimers.removeAll()
 
-        isMotorEnabled = false
+        trackedObstacles.removeAll()
 
-        areUpperLimbsActive = false
-        areLowerLimbsActive = false
-        upperActivationCollisionCount = 0
-        lowerActivationCollisionCount = 0
+        isMotorEnabled = false
 
         if triggerAutoRecalibration {
             autoCalibrationScheduled = false
@@ -1032,188 +1114,241 @@ class BodyTrackingModel {
         lastQuatLogTime[segment] = now
     }
 
-    // MARK: - Activation Trigger Handling
+    // MARK: - Proximity Trigger
 
-    private func refreshActivationTriggers() {
-        let shape = ShapeResource.generateBox(
-            width: activationTriggerWidth,
-            height: activationTriggerHeight,
-            depth: activationTriggerDepth
-        )
-        for trigger in [upperActivationTrigger, lowerActivationTrigger] {
-            guard let trigger = trigger else { continue }
-            var collision = CollisionComponent(shapes: [shape])
-            collision.filter = CollisionFilter(group: .skeleton, mask: .obstacle)
-            trigger.components.set(collision)
-        }
+    /// Rebuilds the proximity sphere collision shape when radius changes.
+    private func refreshProximityTrigger() {
+        guard let trigger = proximityTrigger else { return }
+        let shape = ShapeResource.generateSphere(radius: proximityTriggerRadius)
+        var collision = CollisionComponent(shapes: [shape])
+        collision.filter = CollisionFilter(group: .skeleton, mask: .obstacle)
+        trigger.components.set(collision)
     }
 
-    private func handleActivationBegan(zone: String) {
-        guard isIMUCalibrated else { return }
-
-        if zone == "upper" {
-            upperActivationCollisionCount += 1
-            areUpperLimbsActive = true
-        } else if zone == "lower" {
-            lowerActivationCollisionCount += 1
-            areLowerLimbsActive = true
-        }
-
-        // Skeleton visibility and IMU streaming stay on continuously after
-        // calibration — CrossWalk has a single wandering obstacle, so tying
-        // them to trigger-volume occupancy would make the avatar flicker.
-    }
-
-    private func handleActivationEnded(zone: String) {
-        if zone == "upper" {
-            upperActivationCollisionCount = max(0, upperActivationCollisionCount - 1)
-            guard upperActivationCollisionCount == 0 else { return }
-            areUpperLimbsActive = false
-            for seg in activeSegments where !legSegments.contains(seg) && (motorIsOn[seg] ?? false) {
-                sendMotorCommand(segment: seg, on: false)
-                motorIsOn[seg] = false
-                motorLevelCollisionCounts[seg] = ["far": 0, "med": 0]
-                motorCurrentLevel[seg] = nil
-            }
-        } else if zone == "lower" {
-            lowerActivationCollisionCount = max(0, lowerActivationCollisionCount - 1)
-            guard lowerActivationCollisionCount == 0 else { return }
-            areLowerLimbsActive = false
-            for seg in legSegments where motorIsOn[seg] ?? false {
-                sendMotorCommand(segment: seg, on: false)
-                motorIsOn[seg] = false
-                motorLevelCollisionCounts[seg] = ["far": 0, "med": 0]
-                motorCurrentLevel[seg] = nil
-            }
-        }
+    /// Rebuilds the shoulder-width body sphere collision shape when
+    /// `bodyCollisionRadius` changes.
+    private func refreshBodyCollisionTrigger() {
+        guard let trigger = bodyCollisionTrigger else { return }
+        let shape = ShapeResource.generateSphere(radius: bodyCollisionRadius)
+        var collision = CollisionComponent(shapes: [shape])
+        collision.filter = CollisionFilter(group: .skeleton, mask: .obstacle)
+        trigger.components.set(collision)
     }
 
     // MARK: - Collision Handling
 
-    private enum CollisionTarget {
-        case segment(skeletonID: String, segment: String, level: String)
-        case activation(zone: String)
-    }
-
-    private func parseCollisionTarget(entityAName: String, entityBName: String) -> CollisionTarget? {
-        if let target = parseCollisionTarget(from: entityAName) {
-            return target
-        }
-        return parseCollisionTarget(from: entityBName)
-    }
-
-    private func parseCollisionTarget(from name: String) -> CollisionTarget? {
-        // "center_segmentDetectionTrigger_<segment>_<level>" where level is "far" or "med"
-        if name.hasPrefix("center_segment") {
-            let parts = name.split(separator: "_")
-            guard parts.count >= 4 else { return nil }
-            let skeletonID = String(parts[0])
-            let segment = String(parts[2])
-            let level = String(parts[3])
-            return .segment(skeletonID: skeletonID, segment: segment, level: level)
-        }
-
-        if name.hasPrefix("headsetActivationTrigger_") {
-            let zone = String(name.dropFirst("headsetActivationTrigger_".count))
-            if zone == "upper" || zone == "lower" {
-                return .activation(zone: zone)
-            }
-        }
-
-        return nil
-    }
-
     private func handleCollisionBegan(_ event: CollisionEvents.Began) {
-        guard let target = parseCollisionTarget(entityAName: event.entityA.name, entityBName: event.entityB.name) else {
-            return
-        }
-
-        switch target {
-        case .segment(let skeletonID, let segment, let level):
-            guard let motorTarget = mapCollisionToMotor(skeletonID: skeletonID, segment: segment) else { return }
-
-            motorLevelCollisionCounts[motorTarget, default: [:]][level, default: 0] += 1
-
-            if let imuSeg = HandTrackingManager.IMUBodySegment(rawValue: segment) {
-                handManager.setSegmentCollisionIndicator(skeletonID: skeletonID, segment: imuSeg, isColliding: true)
-            }
-
-            updateMotorForLevelChange(segment: motorTarget)
-
-        case .activation(let zone):
-            handleActivationBegan(zone: zone)
+        print("[Collision] BEGAN a=\(event.entityA.name) b=\(event.entityB.name)")
+        guard let pair = classifyCollision(a: event.entityA, b: event.entityB) else { return }
+        switch pair.trigger {
+        case .proximity:
+            trackedObstacles.insert(pair.obstacle)
+        case .body:
+            // Direct physical contact. Trigger-volume overlap is the source
+            // of truth — no limb-distance threshold check required.
+            print("[Collision] BODY contact with \(pair.obstacle.name)")
+            registerBodyContact(with: pair.obstacle)
         }
     }
 
     private func handleCollisionEnded(_ event: CollisionEvents.Ended) {
-        guard let target = parseCollisionTarget(entityAName: event.entityA.name, entityBName: event.entityB.name) else {
+        guard let pair = classifyCollision(a: event.entityA, b: event.entityB) else { return }
+        switch pair.trigger {
+        case .proximity:
+            trackedObstacles.remove(pair.obstacle)
+            // Motor state for this obstacle is re-evaluated on the next proximity tick.
+        case .body:
+            break
+        }
+    }
+
+    /// Fires COLLIDED or VICTORY based on the obstacle's name. Called from the
+    /// body trigger's Began event, so by definition the user's silhouette
+    /// overlaps the obstacle's collision shape at this moment.
+    private func registerBodyContact(with obstacle: Entity) {
+        let now = CACurrentMediaTime()
+        if obstacle.name.contains("Victory") {
+            lastVictoryTime = now
+            recordVictory()
+        } else if obstacle.name.hasPrefix("CarCube") {
+            lastCollisionTime = now
+            recordCarContact(obstacle.name)
+        } else {
+            // Any other obstacle (e.g. stationary test pillar) still counts
+            // as a generic collision for the banner, but isn't tallied as a car hit.
+            lastCollisionTime = now
+        }
+    }
+
+    private enum TriggerKind { case proximity, body }
+
+    /// Classifies a collision pair. Returns the obstacle entity along with
+    /// which of our two headset-anchored triggers it overlapped, or nil if
+    /// neither entity is one of our triggers (e.g. obstacle-vs-obstacle).
+    private func classifyCollision(a: Entity, b: Entity) -> (obstacle: Entity, trigger: TriggerKind)? {
+        if a.name == "bodyCollisionTrigger"      { return (b, .body) }
+        if b.name == "bodyCollisionTrigger"      { return (a, .body) }
+        if a.name == "headsetProximityTrigger"   { return (b, .proximity) }
+        if b.name == "headsetProximityTrigger"   { return (a, .proximity) }
+        return nil
+    }
+
+    // MARK: - Proximity-Based Motor Update
+
+    /// Called per frame from the scene update loop. Two-pass algorithm:
+    ///   Pass 1 — for each tracked obstacle, find the single closest *eligible*
+    ///   limb (`motorEligibleLimbs`) and assign the obstacle to it.
+    ///   Pass 2 — for each limb, take the minimum distance across the obstacles
+    ///   assigned to it, quantize, drive the motor, update the visualizer.
+    /// Non-eligible limbs and eligible limbs that won no obstacle are forced
+    /// to OFF (and their visualizers hidden), preventing simultaneous vibration
+    /// across multiple limbs from a single nearby object.
+    private func updateMotorsByProximity() {
+        guard isIMUCalibrated else { return }
+
+        let midpoints = handManager.limbMidpoints()
+
+        // Pass 1: per-obstacle, pick the single closest eligible limb.
+        // limbAssignments[limb] holds the smallest (distance, closestPoint)
+        // among all obstacles whose closest eligible limb is `limb`.
+        var limbAssignments: [HandTrackingManager.IMUBodySegment: (dist: Float, closest: SIMD3<Float>)] = [:]
+
+        // Contact (COLLIDED / VICTORY) is handled event-driven by the
+        // shoulder-width body trigger — see `registerBodyContact`. This loop
+        // is now purely motor/visualizer feedback against the larger
+        // proximity sphere.
+        for obstacle in trackedObstacles {
+            let box = obstacle.visualBounds(relativeTo: nil)
+            let isVictory = obstacle.name.contains("Victory")
+
+            // Victory entities never buzz; skip them for motor feedback.
+            guard !isVictory else { continue }
+
+            var winner: HandTrackingManager.IMUBodySegment?
+            var winnerDist: Float = .infinity
+            var winnerClosest: SIMD3<Float> = .zero
+
+            for (imuSeg, limbPos) in midpoints {
+                guard motorEligibleLimbs.contains(imuSeg) else { continue }
+                let closest = clampPointToAABB(limbPos, boxMin: box.min, boxMax: box.max)
+                let d = simd_length(closest - limbPos)
+                if d < winnerDist {
+                    winnerDist = d
+                    winnerClosest = closest
+                    winner = imuSeg
+                }
+            }
+
+            guard let winningLimb = winner else { continue }
+            // Keep the dominant (closest) obstacle for this limb across the frame.
+            if let existing = limbAssignments[winningLimb], existing.dist <= winnerDist { continue }
+            limbAssignments[winningLimb] = (winnerDist, winnerClosest)
+        }
+
+        // Pass 2: drive every limb. Non-eligible and unassigned limbs go to OFF.
+        for (imuSeg, limbPos) in midpoints {
+            if let assignment = limbAssignments[imuSeg] {
+                let level = quantizeDistance(assignment.dist)
+                applyLevel(segment: imuSeg.rawValue, newLevel: level)
+                updateProximityVisualizer(imuSeg: imuSeg, limbPos: limbPos, closestPoint: assignment.closest, level: level)
+            } else {
+                applyLevel(segment: imuSeg.rawValue, newLevel: nil)
+                updateProximityVisualizer(imuSeg: imuSeg, limbPos: limbPos, closestPoint: limbPos, level: nil)
+            }
+        }
+    }
+
+    /// Positions, colors, and orients the per-limb visualizer marker + connector.
+    /// Hidden when the limb is out of range (level == nil) or the toggle is off.
+    private func updateProximityVisualizer(
+        imuSeg: HandTrackingManager.IMUBodySegment,
+        limbPos: SIMD3<Float>,
+        closestPoint: SIMD3<Float>,
+        level: String?
+    ) {
+        guard let marker = closestPointMarkers[imuSeg],
+              let connector = distanceConnectors[imuSeg] else { return }
+
+        guard showProximityVisualizers, let lvl = level else {
+            marker.isEnabled = false
+            connector.isEnabled = false
             return
         }
 
-        switch target {
-        case .segment(let skeletonID, let segment, let level):
-            guard let motorTarget = mapCollisionToMotor(skeletonID: skeletonID, segment: segment) else { return }
-
-            let cur = motorLevelCollisionCounts[motorTarget, default: [:]][level, default: 0]
-            motorLevelCollisionCounts[motorTarget, default: [:]][level] = max(0, cur - 1)
-
-            let deepest = deepestActiveLevel(for: motorTarget)
-            if deepest == nil {
-                if let imuSeg = HandTrackingManager.IMUBodySegment(rawValue: segment) {
-                    handManager.setSegmentCollisionIndicator(skeletonID: skeletonID, segment: imuSeg, isColliding: false)
-                }
-                motorScheduleStop(segment: motorTarget)
-            } else {
-                updateMotorForLevelChange(segment: motorTarget)
-            }
-
-        case .activation(let zone):
-            handleActivationEnded(zone: zone)
+        let color: UIColor
+        switch lvl {
+        case "close": color = .systemRed
+        case "med":   color = .systemYellow
+        default:      color = .systemBlue   // far
         }
+        setVisualizerColor(marker, color: color)
+        setVisualizerColor(connector, color: color)
+
+        marker.position = closestPoint
+        marker.isEnabled = true
+
+        // Scale + orient the connector to span from limbPos to closestPoint.
+        let dir = closestPoint - limbPos
+        let length = simd_length(dir)
+        guard length > 1e-4 else {
+            connector.isEnabled = false
+            return
+        }
+        connector.position = (limbPos + closestPoint) * 0.5
+        let up = SIMD3<Float>(0, 1, 0)
+        connector.orientation = shortestRotation(from: up, to: dir / length)
+        connector.scale = SIMD3<Float>(1, length / connectorBaseHeight, 1)
+        connector.isEnabled = true
     }
 
-    // MARK: - Motor Mapping
-
-    /// Single superimposed skeleton: direct 1:1 mapping.
-    private func mapCollisionToMotor(skeletonID: String, segment: String) -> String? {
-        guard skeletonID == "center" else { return nil }
-        return activeSegments.contains(segment) ? segment : nil
+    private func setVisualizerColor(_ entity: ModelEntity, color: UIColor) {
+        guard var mc = entity.components[ModelComponent.self] else { return }
+        mc.materials = [UnlitMaterial(color: color)]
+        entity.components.set(mc)
     }
 
-    // MARK: - Motor Control
+    /// Clamps `p` into the AABB defined by `[boxMin, boxMax]`. Returns the closest
+    /// point on (or inside) the box. For query points outside, this is the surface
+    /// point; for points inside, this returns the query point itself (distance 0).
+    private func clampPointToAABB(_ p: SIMD3<Float>, boxMin: SIMD3<Float>, boxMax: SIMD3<Float>) -> SIMD3<Float> {
+        return SIMD3<Float>(
+            min(max(p.x, boxMin.x), boxMax.x),
+            min(max(p.y, boxMin.y), boxMax.y),
+            min(max(p.z, boxMin.z), boxMax.z)
+        )
+    }
 
-    private func updateMotorForLevelChange(segment: String) {
-        motorOffDebounceTimers[segment]?.invalidate()
-        motorOffDebounceTimers.removeValue(forKey: segment)
-        guard isMotorEnabled else { return }
+    /// Quantizes a surface distance to a motor level. nil = OFF.
+    private func quantizeDistance(_ d: Float) -> String? {
+        if d < distCloseMax { return "close" }
+        if d < distMedMax   { return "med" }
+        if d <= distFarMax  { return "far" }
+        return nil
+    }
 
-        let deepest = deepestActiveLevel(for: segment)
+    /// Updates motor output for a segment to match `newLevel`, deduping against
+    /// `motorCurrentLevel` to avoid redundant UDP sends. When motors are disabled,
+    /// ON transitions are skipped (state stays at previous) so they fire correctly
+    /// once the user re-enables motors. OFF always goes through.
+    private func applyLevel(segment: String, newLevel: String?) {
         let previous = motorCurrentLevel[segment] ?? nil
+        guard newLevel != previous else { return }
 
-        guard deepest != previous else { return }
-
-        if let level = deepest {
-            let shellIndex = (level == "med") ? 1 : 2  // med=MED, far=FAR
+        if let level = newLevel {
+            guard isMotorEnabled else { return }
+            let shellIndex: Int
+            switch level {
+            case "close": shellIndex = 0
+            case "med":   shellIndex = 1
+            default:      shellIndex = 2   // far
+            }
             sendMotorCommand(segment: segment, on: true, shellIndex: shellIndex)
             motorIsOn[segment] = true
             motorCurrentLevel[segment] = level
-        }
-    }
-
-    private func motorScheduleStop(segment: String) {
-        motorOffDebounceTimers[segment]?.invalidate()
-        motorOffDebounceTimers[segment] = Timer.scheduledTimer(
-            withTimeInterval: motorOffDebounceDelay,
-            repeats: false
-        ) { [weak self] _ in
-            Task { @MainActor in
-                guard let self = self else { return }
-                if self.deepestActiveLevel(for: segment) == nil {
-                    self.sendMotorCommand(segment: segment, on: false)
-                    self.motorIsOn[segment] = false
-                    self.motorCurrentLevel[segment] = nil
-                }
-            }
+        } else {
+            sendMotorCommand(segment: segment, on: false)
+            motorIsOn[segment] = false
+            motorCurrentLevel[segment] = nil
         }
     }
 
@@ -1309,7 +1444,6 @@ class BodyTrackingModel {
             for seg in activeSegments where motorIsOn[seg] ?? false {
                 sendMotorCommand(segment: seg, on: false)
                 motorIsOn[seg] = false
-                motorLevelCollisionCounts[seg] = ["far": 0, "med": 0]
                 motorCurrentLevel[seg] = nil
                 motorOffDebounceTimers[seg]?.invalidate()
                 motorOffDebounceTimers.removeValue(forKey: seg)
@@ -1330,7 +1464,7 @@ class BodyTrackingModel {
                 imuStreamingSegments.remove(seg)
             }
         } else {
-            if areUpperLimbsActive || areLowerLimbsActive {
+            if isIMUCalibrated {
                 startAllLimbIMUs()
             }
         }
