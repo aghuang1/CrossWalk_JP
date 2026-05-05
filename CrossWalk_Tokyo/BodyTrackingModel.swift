@@ -21,8 +21,8 @@ import Network
 // MARK: - Node ID to Body Segment Mapping
 
 // RPi relay address — all commands are sent here; RPi forwards to the correct node
-//let rpiIP = "192.168.1.7"
-let rpiIP = "172.20.10.7"
+let rpiIP = "192.168.1.7"
+//let rpiIP = "172.20.10.7"
 
 // IMU node IDs (byte 0 of each packet) -> segment name
 let nodeIDToSegment: [String: String] = [
@@ -86,6 +86,14 @@ class BodyTrackingModel {
     /// to each tracked obstacle, pick the nearest, and drive motors accordingly.
     private var trackedObstacles: Set<Entity> = []
 
+    /// Per-obstacle limb-selection memory used by `updateMotorsByProximity` to
+    /// apply the deadband (`limbSwitchMargin`) and dwell (`limbSwitchDwell`)
+    /// rules. Keyed by obstacle entity name; the value is the motor segment
+    /// string (e.g. "leftUpperArm", "chest"). Stale entries (obstacles that
+    /// left the proximity sphere) are reaped each frame inside that function.
+    private var lastChosenLimbForObstacle: [String: String] = [:]
+    private var lastLimbSwitchTime: [String: CFTimeInterval] = [:]
+
     /// Most recently sent motor level per segment, used for UDP dedup.
     /// nil = motor is OFF.
     private var motorCurrentLevel: [String: String?] = {
@@ -126,6 +134,23 @@ class BodyTrackingModel {
     private var distanceConnectors: [HandTrackingManager.IMUBodySegment: ModelEntity] = [:]
     private let connectorBaseHeight: Float = 1.0
 
+    // Chest virtual-point visualizers. The position marker is the always-on
+    // orange sphere showing where the back-centerline candidate sits; the
+    // closest-point marker + connector behave like the limb pair but only
+    // light up while chest is winning the per-obstacle proximity contest.
+    private var chestPositionMarker: ModelEntity?
+    private var chestClosestPointMarker: ModelEntity?
+    private var chestConnector: ModelEntity?
+
+    // Translucent flat sector showing the rear cone in which the chest
+    // candidate is allowed to compete. Apex at the head; axis along
+    // `backFlat`; half-angle `rearConeHalfDegrees`. Built lazily and
+    // rebuilt only when the half-angle or radius changes.
+    var showRearConeVisual: Bool = true
+    private var rearConeVisual: ModelEntity?
+    private var lastBuiltConeHalfAngle: Float = -1
+    private var lastBuiltConeRadius: Float = -1
+
     // Distance buckets (meters). Distance is from a limb midpoint to the closest
     // point on an obstacle's AABB.
     //   CLOSE = [0, distCloseMax)
@@ -137,16 +162,85 @@ class BodyTrackingModel {
     var distFarMax: Float = 2.0
 
     // Test obstacle tunables (read live by the ImmersiveView car update loop).
-    // carSpeed: m/s the cars travel along the R→L track.
-    // carDistance: forward distance (meters) from the user origin to the car lane;
-    //   stored as a positive value, applied as -Z in world space.
-    var carSpeed: Float = 3.0
-    var carDistance: Float = 2.0
+    // carSpeed: m/s the cars travel toward the user.
+    var carSpeed: Float = 1.5
     // Independent multipliers for the car hitbox (collision shape) and the
     // toy-car visual mesh. Default 1.0 each. Read live by the ImmersiveView
     // timer so panel changes apply immediately without restarting the run.
-    var carVisualScale: Float = 2.5
+    var carVisualScale: Float = 1.0
     var carHitboxScale: Float = 0.9
+
+    // Cars-from-behind scenario tunables. Each launch picks both a random
+    // lateral X offset (spawn-point displacement) and a random bearing
+    // offset around Y (heading deviation from straight -Z). Combining the
+    // two means dodge direction is dictated by where the trajectory
+    // crosses the user, not just by spawn lane.
+    //
+    //   carSpawnDistance       — +Z distance from origin where cars start.
+    //   maxLateralOffset       — |X| spawn-point cap (m); uniform in [-cap, +cap].
+    //   bearingOffsetDegrees   — heading deviation cap (deg) from straight -Z.
+    //                             Each launch's bearing θ is uniform in
+    //                             [-cap, +cap]; θ=0 is parallel/straight.
+    //   spawnIntervalMin/Max   — seconds. Random gap between launches.
+    //   carsToWinTotal         — cars the user must let pass without contact
+    //                             to trigger VICTORY.
+    var carSpawnDistance: Float = 5.0
+    var maxLateralOffset: Float = 0.10
+    var bearingOffsetDegrees: Float = 0.0
+    var spawnIntervalMin: Float = 4.0
+    var spawnIntervalMax: Float = 5.0
+    var carsToWinTotal: Int = 10
+    var carsAvoidedCount: Int = 0
+
+    // Haptic side-selection stability. The naive "closest eligible limb wins"
+    // rule chatters when an obstacle sits near the per-limb tie line — IMU
+    // jitter alone can flip the selection back and forth. Two knobs:
+    //
+    //   limbSwitchMargin  — meters. Per obstacle, no limb fires unless its
+    //                        distance is smaller than the next-closest
+    //                        eligible limb's distance by more than this
+    //                        margin. The "deadband" between sides is
+    //                        therefore [-margin, +margin] in difference
+    //                        space; inside it, no haptic for that obstacle.
+    //                        Sized just above the skeleton noise floor
+    //                        (~3–4 cm) so real side-bias still triggers.
+    //   limbSwitchDwell   — seconds. Once a limb has been selected for an
+    //                        obstacle, lock the selection for at least this
+    //                        long before allowing a switch to the other
+    //                        side. Filters noise spikes during a legitimate
+    //                        side-to-side transit.
+    var limbSwitchMargin: Float = 0.04
+    var limbSwitchDwell: Float = 0.20
+
+    // Virtual back-centerline haptic candidate. Computed from the headset
+    // transform each frame so it tracks where the user is actually facing
+    // (drift-free, unlike the chest IMU). When this point wins the per-
+    // obstacle proximity contest, the motor segment "chest" (UDP node 3) is
+    // driven instead of either shoulder. Disabled with `chestEligible = false`.
+    //
+    //   chestBackOffset      — meters behind the headset (along headset +Z).
+    //                           Positive = further behind the body.
+    //   chestVerticalOffset  — meters relative to head Y (negative = below).
+    //                           ~-0.40 puts the point at chest level, matching
+    //                           the body collision trigger.
+    var chestEligible: Bool = true
+    var chestBackOffset: Float = 0.18
+    var chestVerticalOffset: Float = -0.40
+
+    // Rear cone (half-angle, degrees) within which the chest candidate is
+    // allowed to compete. Obstacles whose horizontal bearing relative to
+    // headset-forward sits *outside* this cone (i.e. clearly to the side)
+    // exclude the chest candidate, so the dodge-direction signal stays
+    // unambiguous: chest = "behind, dodge either way", shoulder = "side,
+    // dodge the other way". 0° disables chest entirely; 180° always
+    // includes it (no gating).
+    var rearConeHalfDegrees: Float = 5.0
+
+    var spawnIntervalRange: ClosedRange<Double> {
+        let lo = max(0.1, Double(spawnIntervalMin))
+        let hi = max(lo + 0.05, Double(spawnIntervalMax))
+        return lo...hi
+    }
 
     // Limbs that may receive vibrotactile feedback. Per obstacle, only the single
     // closest limb in this set vibrates — preventing both arms (etc.) from firing
@@ -193,8 +287,13 @@ class BodyTrackingModel {
         runEndTime = nil
         totalCarsSpawned = 0
         carsHitInstanceIDs.removeAll()
+        carsAvoidedCount = 0
         lastCollisionTime = -.infinity
         lastVictoryTime = -.infinity
+        // Stale per-obstacle hysteresis/dwell state from the previous run is
+        // never matched again (cars get fresh `_pN` names), so drop it.
+        lastChosenLimbForObstacle.removeAll()
+        lastLimbSwitchTime.removeAll()
     }
 
     func recordCarSpawn() {
@@ -205,6 +304,11 @@ class BodyTrackingModel {
     func recordCarContact(_ instanceID: String) {
         guard isRunActive else { return }
         carsHitInstanceIDs.insert(instanceID)
+    }
+
+    func recordCarAvoided() {
+        guard isRunActive else { return }
+        carsAvoidedCount += 1
     }
 
     func recordVictory() {
@@ -241,7 +345,7 @@ class BodyTrackingModel {
 
     var skeletonForwardOffset: Float = -0.05
     var shoulderVerticalOffset: Float = -0.20
-    var shoulderLateralOffset: Float = 0.25
+    var shoulderLateralOffset: Float = 0.30
     var hipVerticalOffset: Float = -0.70
     var hipLateralOffset: Float = 0.10
 
@@ -397,6 +501,47 @@ class BodyTrackingModel {
             contentEntity.addChild(connector)
             distanceConnectors[imuSeg] = connector
         }
+
+        // Chest virtual-point visualizers. The orange sphere is always
+        // visible (when `showProximityVisualizers && chestEligible`) so the
+        // user can see where the back-centerline candidate sits relative to
+        // their body. The closest-point marker + connector only light up
+        // while chest is the winning candidate for some obstacle.
+        let chestPos = ModelEntity(
+            mesh: .generateSphere(radius: 0.06),
+            materials: [UnlitMaterial(color: .systemOrange)]
+        )
+        chestPos.name = "chestPositionMarker"
+        chestPos.isEnabled = false
+        contentEntity.addChild(chestPos)
+        chestPositionMarker = chestPos
+
+        let chestClosest = ModelEntity(
+            mesh: .generateSphere(radius: 0.04),
+            materials: [UnlitMaterial(color: .white)]
+        )
+        chestClosest.name = "closestPointMarker_chest"
+        chestClosest.isEnabled = false
+        contentEntity.addChild(chestClosest)
+        chestClosestPointMarker = chestClosest
+
+        let chestConn = ModelEntity(
+            mesh: .generateCylinder(height: connectorBaseHeight, radius: 0.006),
+            materials: [UnlitMaterial(color: .white)]
+        )
+        chestConn.name = "distanceConnector_chest"
+        chestConn.isEnabled = false
+        contentEntity.addChild(chestConn)
+        chestConnector = chestConn
+
+        // Flat translucent sector showing the rear-cone gate. Mesh is built
+        // lazily on the first proximity update so it can read the current
+        // `rearConeHalfDegrees` / `proximityTriggerRadius`.
+        let coneEntity = ModelEntity()
+        coneEntity.name = "rearConeVisual"
+        coneEntity.isEnabled = false
+        contentEntity.addChild(coneEntity)
+        rearConeVisual = coneEntity
 
         return contentEntity
     }
@@ -1208,10 +1353,73 @@ class BodyTrackingModel {
 
         let midpoints = handManager.limbMidpoints()
 
-        // Pass 1: per-obstacle, pick the single closest eligible limb.
-        // limbAssignments[limb] holds the smallest (distance, closestPoint)
-        // among all obstacles whose closest eligible limb is `limb`.
-        var limbAssignments: [HandTrackingManager.IMUBodySegment: (dist: Float, closest: SIMD3<Float>)] = [:]
+        // Always-on candidates (eligible IMU limbs). The chest virtual point
+        // is held separately so it can be gated per-obstacle by the rear
+        // cone — this keeps the dodge-direction signal unambiguous: chest
+        // = "behind, dodge either way", shoulder = "side, dodge the other
+        // way".
+        typealias HapticCandidate = (motorSeg: String, position: SIMD3<Float>, imuSeg: HandTrackingManager.IMUBodySegment?)
+        var baseCandidates: [HapticCandidate] = []
+        for (imuSeg, pos) in midpoints where motorEligibleLimbs.contains(imuSeg) {
+            baseCandidates.append((imuSeg.rawValue, pos, imuSeg))
+        }
+
+        // Compute the chest virtual-point position + rear-cone basis (for
+        // per-obstacle gating). World-space, derived from the headset
+        // transform so it tracks where the user is actually facing.
+        var chestCandidate: HapticCandidate? = nil
+        var headPosFlat: SIMD3<Float> = .zero
+        var backFlat: SIMD3<Float> = SIMD3<Float>(0, 0, 1)
+        var rearConeCos: Float = -1
+        if chestEligible, let head = lastHeadsetTransform {
+            let headPos = SIMD3<Float>(head.columns.3.x, head.columns.3.y, head.columns.3.z)
+            let backRaw = SIMD3<Float>(head.columns.2.x, head.columns.2.y, head.columns.2.z)
+            // Project to horizontal so vertical placement is decoupled from
+            // head pitch (looking up/down shouldn't move the chest point).
+            var bf = SIMD3<Float>(backRaw.x, 0, backRaw.z)
+            let mag = simd_length(bf)
+            if mag > 1e-4 { bf /= mag } else { bf = SIMD3<Float>(0, 0, 1) }
+            backFlat = bf
+            headPosFlat = SIMD3<Float>(headPos.x, 0, headPos.z)
+            let chestPos = headPos
+                + backFlat * chestBackOffset
+                + SIMD3<Float>(0, chestVerticalOffset, 0)
+            chestCandidate = (chestSegment, chestPos, nil)
+            let halfRad = max(rearConeHalfDegrees, 0) * .pi / 180
+            rearConeCos = cos(halfRad)
+        }
+
+        // Always-on chest position marker. Visible whenever chest is eligible
+        // and visualizers are on, regardless of whether chest is winning any
+        // obstacle this frame.
+        if let posMarker = chestPositionMarker {
+            if let cc = chestCandidate, showProximityVisualizers {
+                posMarker.position = cc.position
+                if !posMarker.isEnabled { posMarker.isEnabled = true }
+            } else if posMarker.isEnabled {
+                posMarker.isEnabled = false
+            }
+        }
+
+        // Rear-cone debug sector. Only built/positioned when chest is
+        // active; ride along with `showRearConeVisual` toggle. Mesh
+        // rebuilds whenever the half-angle or proximity radius change.
+        updateRearConeVisual(active: chestCandidate != nil,
+                             headPosFlat: headPosFlat,
+                             backFlat: backFlat)
+
+        // Pass 1: per-obstacle, pick a single candidate using a deadband on
+        // the difference between the closest two candidates. If
+        //     dSecond - dMin < limbSwitchMargin
+        // there is no clear winner, so this obstacle contributes no haptic
+        // for this frame (silence is more honest than chatter near the tie
+        // line). When a winner emerges, the dwell rule prevents flipping
+        // candidates faster than `limbSwitchDwell`.
+        var limbAssignments: [String: (dist: Float, closest: SIMD3<Float>)] = [:]
+        var seenObstacleNames: Set<String> = []
+        let now = CACurrentMediaTime()
+        let margin = max(limbSwitchMargin, 0)
+        let dwell = max(CFTimeInterval(limbSwitchDwell), 0)
 
         // Contact (COLLIDED / VICTORY) is handled event-driven by the
         // shoulder-width body trigger — see `registerBodyContact`. This loop
@@ -1223,38 +1431,164 @@ class BodyTrackingModel {
 
             // Victory entities never buzz; skip them for motor feedback.
             guard !isVictory else { continue }
+            seenObstacleNames.insert(obstacle.name)
 
-            var winner: HandTrackingManager.IMUBodySegment?
-            var winnerDist: Float = .infinity
-            var winnerClosest: SIMD3<Float> = .zero
-
-            for (imuSeg, limbPos) in midpoints {
-                guard motorEligibleLimbs.contains(imuSeg) else { continue }
-                let closest = clampPointToAABB(limbPos, boxMin: box.min, boxMax: box.max)
-                let d = simd_length(closest - limbPos)
-                if d < winnerDist {
-                    winnerDist = d
-                    winnerClosest = closest
-                    winner = imuSeg
+            // Per-obstacle candidate set. Start from the always-on shoulders;
+            // include the chest virtual point only when the obstacle's
+            // horizontal bearing is inside the rear cone (i.e. it's
+            // genuinely behind the user, not to a side). This prevents a
+            // chest buzz from arriving for an obstacle that the user can't
+            // attribute to "directly behind" — keeping the dodge cue clear.
+            var candidatesForThisObstacle = baseCandidates
+            if let cc = chestCandidate {
+                let obstacleCenter = obstacle.position(relativeTo: nil)
+                var dir = SIMD3<Float>(obstacleCenter.x - headPosFlat.x, 0,
+                                       obstacleCenter.z - headPosFlat.z)
+                let dmag = simd_length(dir)
+                let inRearCone: Bool
+                if dmag < 1e-4 {
+                    inRearCone = true
+                } else {
+                    dir /= dmag
+                    inRearCone = simd_dot(dir, backFlat) >= rearConeCos
+                }
+                if inRearCone {
+                    candidatesForThisObstacle.append(cc)
                 }
             }
 
-            guard let winningLimb = winner else { continue }
-            // Keep the dominant (closest) obstacle for this limb across the frame.
-            if let existing = limbAssignments[winningLimb], existing.dist <= winnerDist { continue }
-            limbAssignments[winningLimb] = (winnerDist, winnerClosest)
+            // Score every candidate against this obstacle, then track the
+            // closest two so we can apply the deadband rule.
+            var perCand: [String: (dist: Float, closest: SIMD3<Float>)] = [:]
+            var bestSeg: String?
+            var bestDist: Float = .infinity
+            var secondDist: Float = .infinity
+            for cand in candidatesForThisObstacle {
+                let closest = clampPointToAABB(cand.position, boxMin: box.min, boxMax: box.max)
+                let d = simd_length(closest - cand.position)
+                perCand[cand.motorSeg] = (d, closest)
+                if d < bestDist {
+                    secondDist = bestDist
+                    bestDist = d
+                    bestSeg = cand.motorSeg
+                } else if d < secondDist {
+                    secondDist = d
+                }
+            }
+            guard let raw = bestSeg else { continue }
+
+            // Deadband: if the gap between the two closest candidates is
+            // within the margin, we don't have a confident answer. Skip
+            // this obstacle this frame (no haptic). `secondDist` stays
+            // .infinity when only one candidate is in scope, in which case
+            // raw wins outright.
+            let hasClearWinner = (secondDist - bestDist) > margin
+            guard hasClearWinner else {
+                // Don't update lastChosenLimbForObstacle here — we want to
+                // resume from the prior selection if/when the obstacle
+                // re-emerges from the deadband on the same side.
+                continue
+            }
+
+            // Dwell: if the prior winner for this obstacle was a *different*
+            // candidate and we're still inside the dwell window, hold the
+            // prior selection. (Same-candidate re-confirmation: no dwell
+            // penalty.)
+            let chosen: String
+            if let prior = lastChosenLimbForObstacle[obstacle.name],
+               prior != raw,
+               let priorEntry = perCand[prior] {
+                let lastSwitch = lastLimbSwitchTime[obstacle.name] ?? -.infinity
+                if (now - lastSwitch) < dwell {
+                    chosen = prior
+                    if let existing = limbAssignments[chosen], existing.dist <= priorEntry.dist {
+                        // already dominated by another obstacle this frame
+                    } else {
+                        limbAssignments[chosen] = (priorEntry.dist, priorEntry.closest)
+                    }
+                    continue
+                } else {
+                    chosen = raw
+                    lastLimbSwitchTime[obstacle.name] = now
+                }
+            } else {
+                if lastChosenLimbForObstacle[obstacle.name] == nil {
+                    lastLimbSwitchTime[obstacle.name] = now
+                }
+                chosen = raw
+            }
+            lastChosenLimbForObstacle[obstacle.name] = chosen
+
+            guard let entry = perCand[chosen] else { continue }
+            // Keep the dominant (closest) obstacle for this candidate across the frame.
+            if let existing = limbAssignments[chosen], existing.dist <= entry.dist { continue }
+            limbAssignments[chosen] = (entry.dist, entry.closest)
         }
 
-        // Pass 2: drive every limb. Non-eligible and unassigned limbs go to OFF.
-        for (imuSeg, limbPos) in midpoints {
-            if let assignment = limbAssignments[imuSeg] {
+        // Reap selection state for obstacles that have left the proximity
+        // sphere. They'll re-enter (if at all) under a fresh dwell timer.
+        if lastChosenLimbForObstacle.count > seenObstacleNames.count {
+            lastChosenLimbForObstacle = lastChosenLimbForObstacle.filter { seenObstacleNames.contains($0.key) }
+            lastLimbSwitchTime = lastLimbSwitchTime.filter { seenObstacleNames.contains($0.key) }
+        }
+
+        // Pass 2A: drive every always-on candidate (eligible IMU limbs).
+        // Visualizers update for each via the IMU-keyed marker/connector.
+        var candidateMotorSegs: Set<String> = Set(baseCandidates.map { $0.motorSeg })
+        for cand in baseCandidates {
+            if let assignment = limbAssignments[cand.motorSeg] {
                 let level = quantizeDistance(assignment.dist)
-                applyLevel(segment: imuSeg.rawValue, newLevel: level)
-                updateProximityVisualizer(imuSeg: imuSeg, limbPos: limbPos, closestPoint: assignment.closest, level: level)
+                applyLevel(segment: cand.motorSeg, newLevel: level)
+                if let imu = cand.imuSeg {
+                    updateProximityVisualizer(imuSeg: imu, limbPos: cand.position, closestPoint: assignment.closest, level: level)
+                }
             } else {
-                applyLevel(segment: imuSeg.rawValue, newLevel: nil)
-                updateProximityVisualizer(imuSeg: imuSeg, limbPos: limbPos, closestPoint: limbPos, level: nil)
+                applyLevel(segment: cand.motorSeg, newLevel: nil)
+                if let imu = cand.imuSeg {
+                    updateProximityVisualizer(imuSeg: imu, limbPos: cand.position, closestPoint: cand.position, level: nil)
+                }
             }
+        }
+
+        // Pass 2B: drive the chest virtual candidate (motor + dedicated
+        // closest-point/connector visualizer). Skipped entirely when chest
+        // is disabled.
+        if let cc = chestCandidate {
+            candidateMotorSegs.insert(cc.motorSeg)
+            if let assignment = limbAssignments[cc.motorSeg] {
+                let level = quantizeDistance(assignment.dist)
+                applyLevel(segment: cc.motorSeg, newLevel: level)
+                updateProximityVisualizerEntities(
+                    marker: chestClosestPointMarker,
+                    connector: chestConnector,
+                    limbPos: cc.position,
+                    closestPoint: assignment.closest,
+                    level: level
+                )
+            } else {
+                applyLevel(segment: cc.motorSeg, newLevel: nil)
+                updateProximityVisualizerEntities(
+                    marker: chestClosestPointMarker,
+                    connector: chestConnector,
+                    limbPos: cc.position,
+                    closestPoint: cc.position,
+                    level: nil
+                )
+            }
+        } else {
+            // Chest disabled — make sure its visualizer pair is off.
+            chestClosestPointMarker?.isEnabled = false
+            chestConnector?.isEnabled = false
+            applyLevel(segment: chestSegment, newLevel: nil)
+        }
+
+        // Pass 2C: every other IMU midpoint (forearms, legs, …) goes to OFF
+        // along with its visualizer. Ineligible limbs that happen to share
+        // a motor segment with a candidate (e.g. a future chest IMU stream)
+        // are left alone here.
+        for (imuSeg, limbPos) in midpoints where !candidateMotorSegs.contains(imuSeg.rawValue) {
+            applyLevel(segment: imuSeg.rawValue, newLevel: nil)
+            updateProximityVisualizer(imuSeg: imuSeg, limbPos: limbPos, closestPoint: limbPos, level: nil)
         }
     }
 
@@ -1266,8 +1600,25 @@ class BodyTrackingModel {
         closestPoint: SIMD3<Float>,
         level: String?
     ) {
-        guard let marker = closestPointMarkers[imuSeg],
-              let connector = distanceConnectors[imuSeg] else { return }
+        updateProximityVisualizerEntities(
+            marker: closestPointMarkers[imuSeg],
+            connector: distanceConnectors[imuSeg],
+            limbPos: limbPos,
+            closestPoint: closestPoint,
+            level: level
+        )
+    }
+
+    /// Generalized variant that operates on raw entity refs. Used both by the
+    /// per-limb path and by the chest virtual-point visualizer.
+    private func updateProximityVisualizerEntities(
+        marker: ModelEntity?,
+        connector: ModelEntity?,
+        limbPos: SIMD3<Float>,
+        closestPoint: SIMD3<Float>,
+        level: String?
+    ) {
+        guard let marker, let connector else { return }
 
         guard showProximityVisualizers, let lvl = level else {
             marker.isEnabled = false
@@ -1299,6 +1650,87 @@ class BodyTrackingModel {
         connector.orientation = shortestRotation(from: up, to: dir / length)
         connector.scale = SIMD3<Float>(1, length / connectorBaseHeight, 1)
         connector.isEnabled = true
+    }
+
+    /// Builds (or rebuilds) the flat-sector mesh used to visualize the rear
+    /// cone, then positions/orients it at chest level along the current
+    /// horizontal back direction. Hidden when chest is disabled or the
+    /// debug toggle is off. Mesh is rebuilt only when the half-angle or
+    /// radius change, so steady-state cost is just a position + orientation
+    /// write per frame.
+    private func updateRearConeVisual(active: Bool,
+                                      headPosFlat: SIMD3<Float>,
+                                      backFlat: SIMD3<Float>) {
+        guard let cone = rearConeVisual else { return }
+
+        let visible = active && showRearConeVisual && showProximityVisualizers
+        guard visible else {
+            if cone.isEnabled { cone.isEnabled = false }
+            return
+        }
+
+        let halfAngleDeg = max(rearConeHalfDegrees, 0.5)
+        let radius = max(proximityTriggerRadius, 0.5)
+        if abs(halfAngleDeg - lastBuiltConeHalfAngle) > 0.5
+            || abs(radius - lastBuiltConeRadius) > 0.05
+            || cone.model == nil {
+            rebuildRearConeMesh(halfAngleDegrees: halfAngleDeg, radius: radius)
+            lastBuiltConeHalfAngle = halfAngleDeg
+            lastBuiltConeRadius = radius
+        }
+
+        // The mesh is built with apex at origin and axis along local +X (in
+        // the XZ plane). At runtime we orient that local +X to `backFlat`
+        // so the wedge opens horizontally behind the user, then drop the
+        // entity to chest level so it sits in the same plane the cars do.
+        guard let head = lastHeadsetTransform else { return }
+        let headY = head.columns.3.y
+        cone.position = SIMD3<Float>(headPosFlat.x,
+                                     headY + chestVerticalOffset,
+                                     headPosFlat.z)
+        cone.orientation = shortestRotation(from: SIMD3<Float>(1, 0, 0), to: backFlat)
+        if !cone.isEnabled { cone.isEnabled = true }
+    }
+
+    private func rebuildRearConeMesh(halfAngleDegrees: Float, radius: Float) {
+        guard let cone = rearConeVisual else { return }
+
+        let segments = 48
+        let halfRad = halfAngleDegrees * .pi / 180
+        var positions: [SIMD3<Float>] = []
+        positions.reserveCapacity(segments + 2)
+        positions.append(SIMD3<Float>(0, 0, 0))   // apex
+        for i in 0...segments {
+            let t = Float(i) / Float(segments)
+            let a = -halfRad + (2 * halfRad) * t
+            // Sweep around the apex axis (+X) in the XZ plane. Y stays 0
+            // so the sector is flat; the entity is positioned at chest Y
+            // by the caller.
+            let x = cos(a) * radius
+            let z = sin(a) * radius
+            positions.append(SIMD3<Float>(x, 0, z))
+        }
+        var indices: [UInt32] = []
+        indices.reserveCapacity(segments * 3)
+        for i in 0..<segments {
+            indices.append(0)
+            indices.append(UInt32(i + 1))
+            indices.append(UInt32(i + 2))
+        }
+
+        var desc = MeshDescriptor(name: "RearConeSector")
+        desc.positions = MeshBuffers.Positions(positions)
+        desc.primitives = .triangles(indices)
+        do {
+            let mesh = try MeshResource.generate(from: [desc])
+            // Translucent green so it's visually distinct from the orange
+            // chest sphere and the red/yellow/blue distance markers.
+            let mat = UnlitMaterial(color: UIColor.systemGreen.withAlphaComponent(0.18))
+            cone.model = ModelComponent(mesh: mesh, materials: [mat])
+        } catch {
+            // Mesh build failed; leave the entity without a model.
+            cone.model = nil
+        }
     }
 
     private func setVisualizerColor(_ entity: ModelEntity, color: UIColor) {

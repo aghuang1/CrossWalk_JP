@@ -50,18 +50,19 @@ struct ImmersiveView: View {
     // at spawn from `min(hitboxSize / nativeExtents)`. The per-frame timer
     // applies (visualScale / hitboxScale) on top, then multiplies by this.
     @State private var baseToyFitScale: Float = 1.0
-    // +1 = R→L (start at +X, drive to -X), -1 = L→R (start at -X, drive to +X).
-    // Re-rolled per car each time it completes a cycle so direction stays
-    // unpredictable across passes.
-    @State private var carDirections: [Float] = []
-    @State private var carCycleIndices: [Int] = []
-    // Tick at which the current run started (captured when `bodyModel.runStartTime`
-    // transitions to a new value). Car motion uses `(updateTick - runStartTick)
-    // * 0.1` so cars restart from phase 0 on each new run.
-    @State private var runStartTick: Int = 0
+    // Cars-from-behind pool. Each slot is either inactive (`carSpawnTimes[i] == nil`)
+    // or carries a launch with a fixed lateral X spawn offset and a heading
+    // bearing θ (radians around Y, 0 = straight -Z). Position evolves as
+    // `spawn + velocity * elapsed`, where velocity rotates -Z by θ. Once
+    // the car has cleared the user, the slot is recycled and (if not
+    // contacted) counted as an avoidance.
+    @State private var carLateralOffsets: [Float] = []
+    @State private var carBearings: [Float] = []
+    @State private var carSpawnTimes: [CFTimeInterval?] = []
+    @State private var carLaunchedCount: Int = 0
+    @State private var nextSpawnAt: CFTimeInterval = 0
     // Last runStartTime we observed; used to detect new-run transitions.
     @State private var observedRunStartTime: CFTimeInterval? = nil
-    @State private var userStartPosition: SIMD3<Float>?
 
     private let logger = Logger(subsystem: "flavinlab.CrossWalk-Tokyo", category: "WorldTracking")
 
@@ -197,18 +198,22 @@ struct ImmersiveView: View {
                         skydome.position = SIMD3<Float>(0, 0, 0)
                         rootAnchor.addChild(skydome)
 
-                        // Load Tokyo crossing environment (NO collision shapes - visual only)
+                        // Load Tokyo crossing environment (NO collision shapes - visual only).
+                        // Yawed -90° around Y so the painted crosswalk runs perpendicular
+                        // to the user's default forward facing — the user starts with
+                        // their back to the lane direction along which cars approach.
                         let crossTokyoEntity = try await Entity.load(named: "Crossing_Tokyo")
+                        crossTokyoEntity.orientation = simd_quatf(angle: -.pi / 2, axis: SIMD3<Float>(0, 1, 0))
                         crossTokyoEntity.position.y = 5.95
                         rootAnchor.addChild(crossTokyoEntity)
 
-                        // Cars: 5 lanes. Each car is a *cube* (invisible) that
-                        // owns the collision + physics body — the same setup that
-                        // worked when the cube was the visible obstacle — with a
-                        // ToyCar.usdz model parented underneath as the visible
-                        // mesh. Visual is uniform-scaled and yawed so its long
-                        // axis aligns with the road (world X = direction of travel).
-                        let carCount = 5
+                        // Cars-from-behind pool. Each car is a *cube* (invisible)
+                        // that owns the collision + physics body, with a ToyCar.usdz
+                        // model parented underneath as the visible mesh. Pool size
+                        // bounds concurrent in-flight cars; the 10Hz timer block
+                        // launches them one at a time at a random bearing from the
+                        // configured set, with a random gap between launches.
+                        let carCount = 6
                         // Realistic car hitbox in world meters (X = length along
                         // travel, Y = height, Z = width). The previous 7×1.8×5 m
                         // box was so wide that the body trigger sphere overlapped
@@ -222,8 +227,8 @@ struct ImmersiveView: View {
                             // Keep parent at unit scale so child orientations and
                             // hitbox dimensions are not stretched non-uniformly.
                             cube.scale = SIMD3<Float>(repeating: 1)
-                            let laneZ: Float = -bodyModel.carDistance * Float(i + 1)
-                            cube.position = SIMD3<Float>(8.0, 0.65, laneZ)
+                            // Sit at world origin disabled until launched.
+                            cube.position = SIMD3<Float>(0, 0.65, 0)
                             // Explicit CollisionComponent on the ROOT entity so
                             // CollisionEvents.{Began,Ended} fire with entityA/B ==
                             // `cube` itself (name "CarCube_i"). With cube.scale = 1,
@@ -269,41 +274,10 @@ struct ImmersiveView: View {
                             cube.isEnabled = false
                             rootAnchor.addChild(cube)
                             self.carEntities.append(cube)
-                            self.carDirections.append(Bool.random() ? 1.0 : -1.0)
-                            self.carCycleIndices.append(0)
+                            self.carLateralOffsets.append(0)
+                            self.carBearings.append(0)
+                            self.carSpawnTimes.append(nil)
                         }
-
-                        // Stationary obstacle (test): a fixed green pillar offset from
-                        // the wandering cube and car path so collisions can be probed
-                        // against a known, non-moving target.
-                        let stationaryObstacle = try await Entity.load(named: "Cube")
-                        stationaryObstacle.name = "StationaryObstacle"
-                        stationaryObstacle.scale = SIMD3<Float>(1.0, 4.0, 1.0)
-                        stationaryObstacle.position = SIMD3<Float>(0.0, 0.85, 3.5)
-                        self.installObstacleCollision(on: stationaryObstacle, localExtents: SIMD3<Float>(1, 1, 1))
-                        if let modelEntity = stationaryObstacle as? ModelEntity,
-                           var mc = modelEntity.components[ModelComponent.self] as? ModelComponent {
-                            mc.materials = [SimpleMaterial(color: .green, isMetallic: false)]
-                            modelEntity.components[ModelComponent.self] = mc
-                        }
-                        rootAnchor.addChild(stationaryObstacle)
-
-                        // Victory goal: green wall positioned one lane-spacing
-                        // past the final lane. Its name contains "Victory" so
-                        // BodyTrackingModel.updateMotorsByProximity triggers
-                        // `lastVictoryTime` on contact (and skips motor buzz).
-                        let victoryGoal = try await Entity.load(named: "Cube")
-                        victoryGoal.name = "VictoryGoal"
-                        victoryGoal.scale = SIMD3<Float>(4.0, 2.0, 1.0)
-                        let victoryZ: Float = -bodyModel.carDistance * Float(carCount + 1)
-                        victoryGoal.position = SIMD3<Float>(0.0, 1.0, victoryZ)
-                        self.installObstacleCollision(on: victoryGoal, localExtents: SIMD3<Float>(1, 1, 1))
-                        if let modelEntity = victoryGoal as? ModelEntity,
-                           var mc = modelEntity.components[ModelComponent.self] as? ModelComponent {
-                            mc.materials = [SimpleMaterial(color: .green, isMetallic: false)]
-                            modelEntity.components[ModelComponent.self] = mc
-                        }
-                        rootAnchor.addChild(victoryGoal)
 
                         // Directional light
                         let lightEntity = Entity()
@@ -346,12 +320,12 @@ struct ImmersiveView: View {
                         if isVictory, bodyModel.lastVictoryTime > lastRenderedVictoryTime {
                             lastRenderedVictoryTime = bodyModel.lastVictoryTime
                             let duration = bodyModel.runDuration ?? 0
+                            let avoided = bodyModel.carsAvoidedCount
+                            let target = bodyModel.carsToWinTotal
                             let hits = bodyModel.carsHitInstanceIDs.count
-                            let total = bodyModel.totalCarsSpawned
-                            let pct = bodyModel.collisionRatio * 100
                             let line = String(
-                                format: "Time %.2fs   Cars hit %d / %d (%.0f%%)",
-                                duration, hits, total, pct
+                                format: "Time %.2fs   Avoided %d / %d   Hits %d",
+                                duration, avoided, target, hits
                             )
                             statsText.model?.mesh = MeshResource.generateText(
                                 line,
@@ -403,10 +377,10 @@ struct ImmersiveView: View {
                             .foregroundStyle(.white)
                             .monospacedDigit()
                         Text(String(
-                            format: "Cars hit: %d / %d (%.0f%%)",
-                            bodyModel.carsHitInstanceIDs.count,
-                            bodyModel.totalCarsSpawned,
-                            bodyModel.collisionRatio * 100
+                            format: "Avoided %d / %d   Hits %d",
+                            bodyModel.carsAvoidedCount,
+                            bodyModel.carsToWinTotal,
+                            bodyModel.carsHitInstanceIDs.count
                         ))
                         .font(.body)
                         .foregroundStyle(.white)
@@ -423,89 +397,99 @@ struct ImmersiveView: View {
         .ignoresSafeArea()
         // 10Hz timer for car motion and coordinate display
         .onReceive(Timer.publish(every: 0.1, on: .main, in: .common).autoconnect()) { _ in
-            // Cars: Frogger-style. Each car has its own Z-lane (spaced by
-            // bodyModel.carDistance), its own time-phase offset, AND a random
-            // direction (L→R or R→L) that re-rolls each time the car completes
-            // a cycle — so neither lane assignment nor pass count predicts
-            // which way the next car will come.
-            // Detect run start/end transitions so we can reset local car state
-            // and toggle entity visibility without polling.
+            // Cars-from-behind. Each pool slot carries a fixed lateral X
+            // spawn offset and a fixed bearing θ (radians around Y, 0 =
+            // straight -Z). Spawn at (xOffset, ground, +R); velocity is
+            // -Z rotated by θ around Y, so trajectories combine a lane
+            // displacement and a slight angular drift.
             if observedRunStartTime != bodyModel.runStartTime {
                 observedRunStartTime = bodyModel.runStartTime
                 if bodyModel.runStartTime != nil {
-                    // New run began. Reset phase origin and force first-tick
-                    // cycle advance on every car (= first-pass spawn count).
-                    runStartTick = updateTick
-                    for idx in carCycleIndices.indices {
-                        carCycleIndices[idx] = -1
-                    }
-                    for car in carEntities {
-                        car.isEnabled = true
-                    }
+                    // New run began: reset the pool and schedule first spawn.
+                    for car in carEntities { car.isEnabled = false }
+                    for idx in carSpawnTimes.indices { carSpawnTimes[idx] = nil }
+                    for idx in carLateralOffsets.indices { carLateralOffsets[idx] = 0 }
+                    for idx in carBearings.indices { carBearings[idx] = 0 }
+                    carLaunchedCount = 0
+                    nextSpawnAt = CACurrentMediaTime() + 0.5
                 }
             }
+
             if !bodyModel.isRunActive {
-                // Not started yet, or VICTORY reached — hide cars so they
-                // don't clutter the scene or trigger proximity contacts.
-                for car in carEntities where car.isEnabled {
-                    car.isEnabled = false
+                // Not started yet, or VICTORY reached — clear the pool so
+                // stale cars don't linger or trigger contacts.
+                for i in carEntities.indices {
+                    if carEntities[i].isEnabled { carEntities[i].isEnabled = false }
+                    carSpawnTimes[i] = nil
                 }
             } else if !carEntities.isEmpty,
-                      carDirections.count == carEntities.count,
-                      carCycleIndices.count == carEntities.count {
-                let carSpeed: Float = max(bodyModel.carSpeed, 0.01)
-                let trackHalfWidth: Float = 8.0
-                let driveDistance: Float = trackHalfWidth * 2
-                let driveDuration = driveDistance / carSpeed
-                // No park — cars teleport to the opposite edge and immediately
-                // drive back. `cycleDuration == driveDuration`.
-                let cycleDuration: Float = driveDuration
-                // Time origin is the run's start tick, so cars restart from
-                // phase 0 on each new run rather than continuing from wherever
-                // the global updateTick happened to land.
-                let t = Float(updateTick - runStartTick) * 0.1
-                let phaseStride = cycleDuration / Float(carEntities.count)
-                for (i, car) in carEntities.enumerated() {
-                    let laneZ: Float = -bodyModel.carDistance * Float(i + 1)
-                    let totalT = t + Float(i) * phaseStride
-                    let cycleIndex = Int(totalT / cycleDuration)
-                    if cycleIndex != carCycleIndices[i] {
-                        carCycleIndices[i] = cycleIndex
-                        carDirections[i] = Bool.random() ? 1.0 : -1.0
-                        // Unique per-pass name so BodyTrackingModel can tally
-                        // distinct car contacts across cycles.
-                        car.name = "CarCube_\(i)_p\(cycleIndex)"
-                        bodyModel.recordCarSpawn()
-                    }
-                    let direction = carDirections[i]
-                    let startX = trackHalfWidth * direction
-                    let phase = totalT.truncatingRemainder(dividingBy: cycleDuration)
-                    car.position = SIMD3<Float>(
-                        startX - carSpeed * phase * direction,
-                        0.65,
-                        laneZ
-                    )
-                    // Flip the cube 180° around Y when driving R→L so the toy
-                    // car child (oriented to face +X) ends up facing -X with
-                    // the direction of travel. 180° leaves the axis-aligned
-                    // collision box unchanged (its X and Z extents are mirrored).
-                    car.orientation = simd_quatf(
-                        angle: direction == 1 ? .pi : 0,
-                        axis: SIMD3<Float>(0, 1, 0)
-                    )
-                    // Live size: cube parent scale drives the collision hitbox
-                    // (since the local box is in the cube's local space); the
-                    // toy child counter-scales to its own visualScale so the
-                    // two knobs are independent. Net world sizes:
-                    //   hitbox = baseHitboxSize  * carHitboxScale
-                    //   visual = baseToyFitScale * carVisualScale
-                    let hitboxScale = max(bodyModel.carHitboxScale, 0.01)
-                    let visualScale = max(bodyModel.carVisualScale, 0.01)
-                    car.scale = SIMD3<Float>(repeating: hitboxScale)
+                      carLateralOffsets.count == carEntities.count,
+                      carBearings.count == carEntities.count,
+                      carSpawnTimes.count == carEntities.count {
+                let now = CACurrentMediaTime()
+                let speed: Float = max(bodyModel.carSpeed, 0.01)
+                let R: Float = max(bodyModel.carSpawnDistance, 1.0)
+                let totalToWin = bodyModel.carsToWinTotal
+
+                // Spawn launcher.
+                if carLaunchedCount < totalToWin,
+                   now >= nextSpawnAt,
+                   let slot = carSpawnTimes.firstIndex(where: { $0 == nil }) {
+                    let latCap = max(bodyModel.maxLateralOffset, 0)
+                    let bearCapDeg = max(bodyModel.bearingOffsetDegrees, 0)
+                    let bearCapRad = bearCapDeg * .pi / 180
+                    carLateralOffsets[slot] = latCap == 0 ? 0 : Float.random(in: -latCap...latCap)
+                    carBearings[slot] = bearCapRad == 0 ? 0 : Float.random(in: -bearCapRad...bearCapRad)
+                    carSpawnTimes[slot] = now
+                    carLaunchedCount += 1
+                    // Unique per-launch name so BodyTrackingModel's hit set
+                    // dedupes correctly across pool recycling.
+                    carEntities[slot].name = "CarCube_\(slot)_p\(carLaunchedCount)"
+                    carEntities[slot].isEnabled = true
+                    bodyModel.recordCarSpawn()
+                    nextSpawnAt = now + Double.random(in: bodyModel.spawnIntervalRange)
+                }
+
+                // Per-car position update. Velocity = rotateAroundY(-Z, θ),
+                // so vx = sin(θ)*speed (drift), vz = -cos(θ)*speed (forward).
+                let pastOriginThreshold: Float = 4.0
+                let hitboxScale = max(bodyModel.carHitboxScale, 0.01)
+                let visualScale = max(bodyModel.carVisualScale, 0.01)
+                for i in carEntities.indices {
+                    guard let t0 = carSpawnTimes[i] else { continue }
+                    let elapsed = Float(now - t0)
+                    let theta = carBearings[i]
+                    let s = sin(theta), c = cos(theta)
+                    let xPos = carLateralOffsets[i] + speed * s * elapsed
+                    let zPos = R - speed * c * elapsed
+                    carEntities[i].position = SIMD3<Float>(xPos, 0.65, zPos)
+                    // Yaw the cube so its +X (the toy's "front") aligns with
+                    // velocity direction (sin θ, 0, -cos θ). A Y-rotation by
+                    // `yaw` maps (1,0,0) → (cos yaw, 0, -sin yaw); equating
+                    // gives yaw = π/2 - θ. (θ=0 ⇒ yaw=π/2, matches straight-Z.)
+                    let yaw: Float = .pi / 2 - theta
+                    carEntities[i].orientation = simd_quatf(angle: yaw, axis: SIMD3<Float>(0, 1, 0))
+                    carEntities[i].scale = SIMD3<Float>(repeating: hitboxScale)
                     if i < toyEntities.count {
                         toyEntities[i].scale = SIMD3<Float>(
                             repeating: baseToyFitScale * visualScale / hitboxScale
                         )
+                    }
+
+                    // Recycle once the car is well past the origin (use the
+                    // forward-distance projection so wide bearings still
+                    // recycle on the same threshold).
+                    let forwardDist = R - speed * c * elapsed
+                    if forwardDist < -pastOriginThreshold {
+                        let nameAtPass = carEntities[i].name
+                        carSpawnTimes[i] = nil
+                        carEntities[i].isEnabled = false
+                        if !bodyModel.carsHitInstanceIDs.contains(nameAtPass) {
+                            bodyModel.recordCarAvoided()
+                        }
+                        if bodyModel.carsAvoidedCount >= totalToWin {
+                            bodyModel.recordVictory()
+                        }
                     }
                 }
             }

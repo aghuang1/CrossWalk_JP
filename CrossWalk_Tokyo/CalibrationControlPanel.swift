@@ -185,13 +185,66 @@ struct ControlOverlayPanel: View {
                     StepperRow(label: "Med Max", value: $model.distMedMax, step: 0.05)
                     StepperRow(label: "Far Max", value: $model.distFarMax, step: 0.05)
 
+                    SectionHeader("Haptic Side Stability")
+                    // Deadband: per obstacle, no limb fires unless its
+                    // distance beats the next-closest limb by more than
+                    // this margin. Inside the band, no haptic for that
+                    // obstacle (silence rather than flicker at the tie line).
+                    StepperRow(label: "Side Margin (m)", value: $model.limbSwitchMargin, step: 0.01)
+                    // Dwell: once a side has been selected, lock it for at
+                    // least this long before allowing a switch to the other.
+                    StepperRow(label: "Switch Dwell (s)", value: $model.limbSwitchDwell, step: 0.05)
+
+                    SectionHeader("Chest Haptic (Back-Center)")
+                    // Toggle the virtual back-centerline candidate that
+                    // drives the "chest" motor (UDP node 3).
+                    HStack(spacing: 12) {
+                        ToggleButton(
+                            label: model.chestEligible ? "Chest On" : "Chest Off",
+                            isActive: model.chestEligible,
+                            activeColor: .green,
+                            inactiveColor: .gray,
+                            systemImage: model.chestEligible ? "circle.fill" : "circle"
+                        ) {
+                            model.chestEligible.toggle()
+                        }
+                    }
+                    StepperRow(label: "Back Offset (m)", value: $model.chestBackOffset, step: 0.02)
+                    StepperRow(label: "Vert Offset (m)", value: $model.chestVerticalOffset, step: 0.02)
+                    // Rear cone half-angle: chest only competes for obstacles
+                    // whose horizontal bearing is within this many degrees
+                    // of straight behind the user. Outside the cone, chest
+                    // is silent and the shoulder takes the obstacle.
+                    StepperRow(label: "Rear Cone (°)", value: $model.rearConeHalfDegrees, step: 5.0)
+                    HStack(spacing: 12) {
+                        ToggleButton(
+                            label: model.showRearConeVisual ? "Cone Visible" : "Cone Hidden",
+                            isActive: model.showRearConeVisual,
+                            activeColor: .green,
+                            inactiveColor: .gray,
+                            systemImage: "eye"
+                        ) {
+                            model.showRearConeVisual.toggle()
+                        }
+                    }
+
                     SectionHeader("Cars")
                     StepperRow(label: "Speed (m/s)", value: $model.carSpeed, step: 0.5)
-                    StepperRow(label: "Distance (m)", value: $model.carDistance, step: 0.5)
+                    StepperRow(label: "Spawn Dist (m)", value: $model.carSpawnDistance, step: 1.0)
                     // Independent multipliers for the toy-car visual mesh and
                     // the collision hitbox, so the two can be tuned separately.
                     StepperRow(label: "Visual Size", value: $model.carVisualScale, step: 0.1)
                     StepperRow(label: "Hitbox Size", value: $model.carHitboxScale, step: 0.1)
+
+                    SectionHeader("Cars-from-behind Scenario")
+                    // Per-launch random spawn-point offset along ±X (m) AND
+                    // heading deviation around Y (deg). Set either to 0 to
+                    // disable that source of randomness.
+                    StepperRow(label: "Max Lat Offset (m)", value: $model.maxLateralOffset, step: 0.1)
+                    StepperRow(label: "Bearing Offset (°)", value: $model.bearingOffsetDegrees, step: 1.0)
+                    StepperRow(label: "Spawn Min (s)", value: $model.spawnIntervalMin, step: 0.25)
+                    StepperRow(label: "Spawn Max (s)", value: $model.spawnIntervalMax, step: 0.25)
+                    IntStepperRow(label: "Win Count", value: $model.carsToWinTotal, step: 1)
                 }
             }
             .frame(maxHeight: 500)
@@ -244,6 +297,50 @@ struct StepperRow: View {
             .buttonBorderShape(.circle)
 
             Text(String(format: "%.2f", value))
+                .font(.system(size: 18, weight: .semibold, design: .monospaced))
+                .foregroundStyle(.white)
+                .frame(width: 60, alignment: .center)
+
+            Button {
+                value += step
+            } label: {
+                Image(systemName: "plus.circle.fill")
+                    .font(.system(size: 52))
+                    .foregroundStyle(.white.opacity(0.85))
+                    .frame(width: 72, height: 72)
+                    .contentShape(Rectangle())
+            }
+            .buttonBorderShape(.circle)
+        }
+    }
+}
+
+// MARK: - Int Stepper Row
+
+struct IntStepperRow: View {
+    let label: String
+    @Binding var value: Int
+    var step: Int = 1
+
+    var body: some View {
+        HStack(spacing: 10) {
+            Text(label)
+                .font(.system(size: 14))
+                .foregroundStyle(.white.opacity(0.9))
+                .frame(width: 90, alignment: .leading)
+
+            Button {
+                value = max(0, value - step)
+            } label: {
+                Image(systemName: "minus.circle.fill")
+                    .font(.system(size: 52))
+                    .foregroundStyle(.white.opacity(0.85))
+                    .frame(width: 72, height: 72)
+                    .contentShape(Rectangle())
+            }
+            .buttonBorderShape(.circle)
+
+            Text("\(value)")
                 .font(.system(size: 18, weight: .semibold, design: .monospaced))
                 .foregroundStyle(.white)
                 .frame(width: 60, alignment: .center)
