@@ -325,7 +325,21 @@ class HandTrackingManager {
         )
         cylinder.name = name
         applyNoOcclusion(to: cylinder)
+        installLimbCollision(on: cylinder, height: height, radius: radius)
         return cylinder
+    }
+
+    /// Adds (or refreshes) a CollisionComponent on a skeleton-cylinder
+    /// `ModelEntity` so it emits CollisionEvents when it intersects an
+    /// obstacle. Filter: `.skeleton` group, `.obstacle` mask. Shape is a
+    /// box bounding the cylinder (axis-aligned in cylinder-local space).
+    func installLimbCollision(on cylinder: ModelEntity, height: Float, radius: Float) {
+        let h = max(0.02, height)
+        let r = max(0.01, radius)
+        let shape = ShapeResource.generateBox(width: r * 2, height: h, depth: r * 2)
+        var collision = CollisionComponent(shapes: [shape])
+        collision.filter = CollisionFilter(group: .skeleton, mask: .obstacle)
+        cylinder.components.set(collision)
     }
 
     private func applyNoOcclusion(to entity: ModelEntity) {
@@ -470,6 +484,12 @@ class HandTrackingManager {
             updateCylinder(instance.rightUpperArmCylinder, height: upperArmLength, radius: upperArmRadius)
             updateCylinder(instance.leftForearmCylinder, height: forearmLength, radius: forearmRadius)
             updateCylinder(instance.rightForearmCylinder, height: forearmLength, radius: forearmRadius)
+            // Refresh collision shapes so cylinder-vs-obstacle hit tests
+            // track the new mesh dimensions.
+            if let c = instance.leftUpperArmCylinder  { installLimbCollision(on: c, height: upperArmLength, radius: upperArmRadius) }
+            if let c = instance.rightUpperArmCylinder { installLimbCollision(on: c, height: upperArmLength, radius: upperArmRadius) }
+            if let c = instance.leftForearmCylinder   { installLimbCollision(on: c, height: forearmLength, radius: forearmRadius) }
+            if let c = instance.rightForearmCylinder  { installLimbCollision(on: c, height: forearmLength, radius: forearmRadius) }
 
             instance.leftElbowPivot?.position.y = -upperArmLength
             instance.rightElbowPivot?.position.y = -upperArmLength
@@ -482,6 +502,10 @@ class HandTrackingManager {
             updateCylinder(instance.rightThighCylinder, height: thighLength, radius: thighRadius)
             updateCylinder(instance.leftShankCylinder, height: shankLength, radius: shankRadius)
             updateCylinder(instance.rightShankCylinder, height: shankLength, radius: shankRadius)
+            if let c = instance.leftThighCylinder  { installLimbCollision(on: c, height: thighLength, radius: thighRadius) }
+            if let c = instance.rightThighCylinder { installLimbCollision(on: c, height: thighLength, radius: thighRadius) }
+            if let c = instance.leftShankCylinder  { installLimbCollision(on: c, height: shankLength, radius: shankRadius) }
+            if let c = instance.rightShankCylinder { installLimbCollision(on: c, height: shankLength, radius: shankRadius) }
 
             instance.leftKneePivot?.position.y = -thighLength
             instance.rightKneePivot?.position.y = -thighLength
@@ -491,21 +515,54 @@ class HandTrackingManager {
         }
     }
 
-    // MARK: - Limb midpoints (for proximity-based distance queries)
+    // MARK: - Limb contact points (for proximity-based distance queries)
 
-    /// Returns the world-space midpoint of each limb segment cylinder. Used by
-    /// BodyTrackingModel's per-frame obstacle-distance calculation.
-    func limbMidpoints() -> [IMUBodySegment: SIMD3<Float>] {
+    /// Returns the world-space point on each limb that should be used for
+    /// obstacle-distance calculations. Per-limb policy:
+    ///   - Upper arms / thighs: cylinder midpoint (the limb segment center).
+    ///   - Forearms: distal end (wrist marker — closest to the hand the
+    ///     user actually leads with toward an obstacle).
+    ///   - Shanks: distal end (ankle marker — closest to the foot, which
+    ///     is what touches a low obstacle like a curb first).
+    /// Used by BodyTrackingModel's per-frame proximity loop.
+    func limbContactPoints() -> [IMUBodySegment: SIMD3<Float>] {
         guard let instance = skeletons["center"] else { return [:] }
         var out: [IMUBodySegment: SIMD3<Float>] = [:]
         if let e = instance.leftUpperArmCylinder  { out[.leftUpperArm]  = e.position(relativeTo: nil) }
-        if let e = instance.leftForearmCylinder   { out[.leftForearm]   = e.position(relativeTo: nil) }
         if let e = instance.rightUpperArmCylinder { out[.rightUpperArm] = e.position(relativeTo: nil) }
-        if let e = instance.rightForearmCylinder  { out[.rightForearm]  = e.position(relativeTo: nil) }
         if let e = instance.leftThighCylinder     { out[.leftThigh]     = e.position(relativeTo: nil) }
-        if let e = instance.leftShankCylinder     { out[.leftShank]     = e.position(relativeTo: nil) }
         if let e = instance.rightThighCylinder    { out[.rightThigh]    = e.position(relativeTo: nil) }
-        if let e = instance.rightShankCylinder    { out[.rightShank]    = e.position(relativeTo: nil) }
+
+        // Forearm distal end = wrist marker (child of elbow pivot). Falls
+        // back to the cylinder midpoint if the marker isn't found.
+        if let pivot = instance.leftElbowPivot,
+           let wrist = pivot.children.first(where: { $0.name.contains("WristMarker") }) {
+            out[.leftForearm] = wrist.position(relativeTo: nil)
+        } else if let e = instance.leftForearmCylinder {
+            out[.leftForearm] = e.position(relativeTo: nil)
+        }
+        if let pivot = instance.rightElbowPivot,
+           let wrist = pivot.children.first(where: { $0.name.contains("WristMarker") }) {
+            out[.rightForearm] = wrist.position(relativeTo: nil)
+        } else if let e = instance.rightForearmCylinder {
+            out[.rightForearm] = e.position(relativeTo: nil)
+        }
+
+        // Shank distal end = ankle marker (child of knee pivot). Same
+        // fallback to the cylinder midpoint if missing.
+        if let pivot = instance.leftKneePivot,
+           let ankle = pivot.children.first(where: { $0.name.contains("AnkleMarker") }) {
+            out[.leftShank] = ankle.position(relativeTo: nil)
+        } else if let e = instance.leftShankCylinder {
+            out[.leftShank] = e.position(relativeTo: nil)
+        }
+        if let pivot = instance.rightKneePivot,
+           let ankle = pivot.children.first(where: { $0.name.contains("AnkleMarker") }) {
+            out[.rightShank] = ankle.position(relativeTo: nil)
+        } else if let e = instance.rightShankCylinder {
+            out[.rightShank] = e.position(relativeTo: nil)
+        }
+
         return out
     }
 

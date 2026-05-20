@@ -21,8 +21,8 @@ import Network
 // MARK: - Node ID to Body Segment Mapping
 
 // RPi relay address — all commands are sent here; RPi forwards to the correct node
-let rpiIP = "192.168.1.7"
-//let rpiIP = "172.20.10.7"
+//let rpiIP = "192.168.1.7"
+let rpiIP = "172.20.10.7"
 
 // IMU node IDs (byte 0 of each packet) -> segment name
 let nodeIDToSegment: [String: String] = [
@@ -86,14 +86,6 @@ class BodyTrackingModel {
     /// to each tracked obstacle, pick the nearest, and drive motors accordingly.
     private var trackedObstacles: Set<Entity> = []
 
-    /// Per-obstacle limb-selection memory used by `updateMotorsByProximity` to
-    /// apply the deadband (`limbSwitchMargin`) and dwell (`limbSwitchDwell`)
-    /// rules. Keyed by obstacle entity name; the value is the motor segment
-    /// string (e.g. "leftUpperArm", "chest"). Stale entries (obstacles that
-    /// left the proximity sphere) are reaped each frame inside that function.
-    private var lastChosenLimbForObstacle: [String: String] = [:]
-    private var lastLimbSwitchTime: [String: CFTimeInterval] = [:]
-
     /// Most recently sent motor level per segment, used for UDP dedup.
     /// nil = motor is OFF.
     private var motorCurrentLevel: [String: String?] = {
@@ -130,6 +122,13 @@ class BodyTrackingModel {
     // point + thin cylinder from limb midpoint to that point. Color-coded by
     // distance bucket (red/yellow/blue). Hidden when a limb is out of range.
     var showProximityVisualizers: Bool = true
+
+    // Debug toggle: when false, the Tokyo crossing scene model and the
+    // sky-blue skydome are hidden so the user can iterate on body tracking
+    // / skeleton / haptics without the immersive environment in the way.
+    // Default off for now — flip on once the rest of the system is solid.
+    var showVREnvironment: Bool = true
+
     private var closestPointMarkers: [HandTrackingManager.IMUBodySegment: ModelEntity] = [:]
     private var distanceConnectors: [HandTrackingManager.IMUBodySegment: ModelEntity] = [:]
     private let connectorBaseHeight: Float = 1.0
@@ -157,60 +156,51 @@ class BodyTrackingModel {
     //   MED   = [distCloseMax, distMedMax)
     //   FAR   = [distMedMax, distFarMax]
     //   OFF   > distFarMax
-    var distCloseMax: Float = 0.5
-    var distMedMax: Float = 1.0
-    var distFarMax: Float = 2.0
+    var distCloseMax: Float = 0.15
+    var distMedMax: Float = 0.20
+    var distFarMax: Float = 0.40
 
-    // Test obstacle tunables (read live by the ImmersiveView car update loop).
-    // carSpeed: m/s the cars travel toward the user.
-    var carSpeed: Float = 1.5
-    // Independent multipliers for the car hitbox (collision shape) and the
-    // toy-car visual mesh. Default 1.0 each. Read live by the ImmersiveView
-    // timer so panel changes apply immediately without restarting the run.
-    var carVisualScale: Float = 1.0
-    var carHitboxScale: Float = 0.9
-
-    // Cars-from-behind scenario tunables. Each launch picks both a random
-    // lateral X offset (spawn-point displacement) and a random bearing
-    // offset around Y (heading deviation from straight -Z). Combining the
-    // two means dodge direction is dictated by where the trajectory
-    // crosses the user, not just by spawn lane.
+    // Forward obstacle-course tunables. The user walks along -Z through a
+    // corridor of randomly-placed rectangular-prism obstacles to reach a
+    // VictoryGoal at the far end.
     //
-    //   carSpawnDistance       — +Z distance from origin where cars start.
-    //   maxLateralOffset       — |X| spawn-point cap (m); uniform in [-cap, +cap].
-    //   bearingOffsetDegrees   — heading deviation cap (deg) from straight -Z.
-    //                             Each launch's bearing θ is uniform in
-    //                             [-cap, +cap]; θ=0 is parallel/straight.
-    //   spawnIntervalMin/Max   — seconds. Random gap between launches.
-    //   carsToWinTotal         — cars the user must let pass without contact
-    //                             to trigger VICTORY.
-    var carSpawnDistance: Float = 5.0
-    var maxLateralOffset: Float = 0.10
-    var bearingOffsetDegrees: Float = 0.0
-    var spawnIntervalMin: Float = 4.0
-    var spawnIntervalMax: Float = 5.0
-    var carsToWinTotal: Int = 10
-    var carsAvoidedCount: Int = 0
+    //   coursePathLength     — meters along -Z covered by the obstacle slots.
+    //                          The VictoryGoal sits a bit past this.
+    //   corridorHalfWidth    — meters; the playable corridor runs ±this.
+    //   obstacleCount        — number of obstacles per run. Each one is a
+    //                          uniform-random pick from the 4 type specs in
+    //                          ImmersiveView (curb / trash can / signpost / wall).
+    //   obstacleMinSpacing   — meters between consecutive obstacle Z slots.
+    var coursePathLength: Float = 7.5    // user-to-goal distance, meters (auto-extended if obstacle layout needs more)
+    var corridorHalfWidth: Float = 2.0
+    var obstacleCount: Int = 5
+    var obstacleMinSpacing: Float = 1.5  // fixed Z gap between consecutive obstacles
+    // Seconds between Start being pressed and the obstacle course
+    // populating. Lets a blindfolded subject press Start, close their
+    // eyes, and have the course materialize after a known prep window.
+    // The head-anchored elapsed-time readout is hidden during this window
+    // and reset to 0 at the moment the course spawns.
+    var courseStartGraceSec: Float = 3.0
+    // Single-side testing aid. When true, every obstacle spawns to the
+    // right of the corridor centerline (positive X) so a subject with
+    // motors only on the right side can encounter every obstacle on the
+    // instrumented limbs. Set false for normal alternating-side play.
+    var spawnRightSideOnly: Bool = false
 
-    // Haptic side-selection stability. The naive "closest eligible limb wins"
-    // rule chatters when an obstacle sits near the per-limb tie line — IMU
-    // jitter alone can flip the selection back and forth. Two knobs:
-    //
-    //   limbSwitchMargin  — meters. Per obstacle, no limb fires unless its
-    //                        distance is smaller than the next-closest
-    //                        eligible limb's distance by more than this
-    //                        margin. The "deadband" between sides is
-    //                        therefore [-margin, +margin] in difference
-    //                        space; inside it, no haptic for that obstacle.
-    //                        Sized just above the skeleton noise floor
-    //                        (~3–4 cm) so real side-bias still triggers.
-    //   limbSwitchDwell   — seconds. Once a limb has been selected for an
-    //                        obstacle, lock the selection for at least this
-    //                        long before allowing a switch to the other
-    //                        side. Filters noise spikes during a legitimate
-    //                        side-to-side transit.
-    var limbSwitchMargin: Float = 0.04
-    var limbSwitchDwell: Float = 0.20
+    // Set by ImmersiveView at Start so the on-victory stats line can render
+    // "touched N / TOTAL". Held here (not in the view) so SwiftUI re-reads
+    // it via @Observable.
+    private(set) var totalObstaclesInCourse: Int = 0
+    func setObstacleCourseTotal(_ n: Int) { totalObstaclesInCourse = n }
+
+    // Haptic tie-tolerance. Per obstacle, every eligible limb whose
+    // distance to that obstacle is within `limbSwitchMargin` of the closest
+    // limb's distance fires (and has its visualizer drawn). So if both
+    // shoulders are roughly equidistant to a frontal wall, both vibrate;
+    // if the user is clearly leaning to one side, only that side fires.
+    // Sized just above the skeleton noise floor so single-limb reads stay
+    // single-limb and real near-ties trigger together.
+    var limbSwitchMargin: Float = 0.05
 
     // Virtual back-centerline haptic candidate. Computed from the headset
     // transform each frame so it tracks where the user is actually facing
@@ -236,17 +226,17 @@ class BodyTrackingModel {
     // includes it (no gating).
     var rearConeHalfDegrees: Float = 5.0
 
-    var spawnIntervalRange: ClosedRange<Double> {
-        let lo = max(0.1, Double(spawnIntervalMin))
-        let hi = max(lo + 0.05, Double(spawnIntervalMax))
-        return lo...hi
-    }
-
-    // Limbs that may receive vibrotactile feedback. Per obstacle, only the single
-    // closest limb in this set vibrates — preventing both arms (etc.) from firing
-    // on the same nearby object. Scale by adding more `IMUBodySegment` cases.
+    // Limbs that may receive vibrotactile feedback. Per obstacle, every
+    // eligible limb within `limbSwitchMargin` of the closest limb's
+    // distance fires — so genuinely-tied limbs all vibrate together.
+    // Contact points come from `handManager.limbContactPoints()` which
+    // uses the cylinder midpoint for upper arm + thigh and the distal
+    // end (wrist / ankle) for forearm + shank.
     private let motorEligibleLimbs: Set<HandTrackingManager.IMUBodySegment> = [
-        .leftUpperArm, .rightUpperArm
+        .leftUpperArm,  .rightUpperArm,
+        .leftForearm,   .rightForearm,
+        .leftThigh,     .rightThigh,
+        .leftShank,     .rightShank
     ]
 
     // Collision display. `lastCollisionTime` / `lastVictoryTime` are bumped
@@ -260,15 +250,14 @@ class BodyTrackingModel {
 
     // Run lifecycle + stats. `runStartTime == nil` before the user has pressed
     // START; `runEndTime != nil` once VICTORY has fired. `isRunActive` is
-    // true only between those two events — during which time the cars move,
-    // spawn counting accumulates, and contacts are tallied.
+    // true only between those two events — during which time obstacles
+    // exist, contacts are tallied, and the timer ticks.
     var runStartTime: CFTimeInterval? = nil
     var runEndTime: CFTimeInterval? = nil
-    var totalCarsSpawned: Int = 0
-    // Per-pass car IDs. The caller (ImmersiveView) renames each car as
-    // "CarCube_<lane>_p<passIndex>" on cycle rollovers so each pass is a
-    // distinct key here, even though the underlying entity is reused.
-    var carsHitInstanceIDs: Set<String> = []
+    // Per-run obstacle entity names that registered a body-trigger contact.
+    // ImmersiveView gives each obstacle a unique `_p<runIndex>` suffix so
+    // the dedupe set never collides across runs.
+    var obstaclesHitInstanceIDs: Set<String> = []
 
     var isRunActive: Bool {
         runStartTime != nil && runEndTime == nil
@@ -277,38 +266,31 @@ class BodyTrackingModel {
         guard let s = runStartTime, let e = runEndTime else { return nil }
         return e - s
     }
-    var collisionRatio: Double {
-        guard totalCarsSpawned > 0 else { return 0 }
-        return Double(carsHitInstanceIDs.count) / Double(totalCarsSpawned)
-    }
 
     func startRun() {
         runStartTime = CACurrentMediaTime()
         runEndTime = nil
-        totalCarsSpawned = 0
-        carsHitInstanceIDs.removeAll()
-        carsAvoidedCount = 0
+        obstaclesHitInstanceIDs.removeAll()
         lastCollisionTime = -.infinity
         lastVictoryTime = -.infinity
-        // Stale per-obstacle hysteresis/dwell state from the previous run is
-        // never matched again (cars get fresh `_pN` names), so drop it.
-        lastChosenLimbForObstacle.removeAll()
-        lastLimbSwitchTime.removeAll()
     }
 
-    func recordCarSpawn() {
-        guard isRunActive else { return }
-        totalCarsSpawned += 1
+    /// Cancels an in-progress run without recording a victory. Sets
+    /// `runStartTime = nil` so `isRunActive` flips false; ImmersiveView's
+    /// 10 Hz observer detects the transition and tears down the spawned
+    /// obstacles + hides the victory goal. Stats are cleared so the
+    /// post-run results panel doesn't linger from a half-finished run.
+    func stopRun() {
+        runStartTime = nil
+        runEndTime = nil
+        obstaclesHitInstanceIDs.removeAll()
+        lastCollisionTime = -.infinity
+        lastVictoryTime = -.infinity
     }
 
-    func recordCarContact(_ instanceID: String) {
+    func recordObstacleContact(_ instanceID: String) {
         guard isRunActive else { return }
-        carsHitInstanceIDs.insert(instanceID)
-    }
-
-    func recordCarAvoided() {
-        guard isRunActive else { return }
-        carsAvoidedCount += 1
+        obstaclesHitInstanceIDs.insert(instanceID)
     }
 
     func recordVictory() {
@@ -322,14 +304,21 @@ class BodyTrackingModel {
 
     // MARK: - Manual Override Flags
 
-    var isMotorEnabled: Bool = false
+    var isMotorEnabled: Bool = true
     var isIMUOverrideActive: Bool = false
 
     var isCalibrated: Bool { calibrationState == .calibrated }
     var isCalibrating: Bool { calibrationState != .notCalibrated && calibrationState != .calibrated }
 
     var calibrationStatusTitle: String = "Not Calibrated"
-    var calibrationStatusDetail: String = "Press Re-Calibrate to begin two-pose calibration."
+    var calibrationStatusDetail: String = "Press Calibrate when ready to begin two-pose calibration."
+
+    // Per-segment timestamp of the most recent quaternion packet. The control
+    // panel's live "Receiving IMU data" indicator filters this against
+    // CACurrentMediaTime() to count segments that arrived in the last second
+    // — gives an at-a-glance confirmation that sensors are streaming before
+    // the user presses Calibrate.
+    var lastSegmentPacketTime: [String: CFTimeInterval] = [:]
     var calibrationCountdownSeconds: Int?
     var calibrationCountdownTotalSeconds: Int?
     var calibrationProgressFraction: Double {
@@ -347,7 +336,7 @@ class BodyTrackingModel {
     var shoulderVerticalOffset: Float = -0.20
     var shoulderLateralOffset: Float = 0.30
     var hipVerticalOffset: Float = -0.70
-    var hipLateralOffset: Float = 0.10
+    var hipLateralOffset: Float = 0.20
 
     // Superimposed skeleton: zero radius, single angle (facing forward).
     var skeletonRadius: Float = 0.0
@@ -362,7 +351,7 @@ class BodyTrackingModel {
     var forearmRadius: Float = 0.08 { didSet { geometryNeedsRefresh = true } }
     var thighLength: Float = 0.45 { didSet { geometryNeedsRefresh = true } }
     var thighRadius: Float = 0.10 { didSet { geometryNeedsRefresh = true } }
-    var shankLength: Float = 0.17 { didSet { geometryNeedsRefresh = true } }
+    var shankLength: Float = 0.26 { didSet { geometryNeedsRefresh = true } }
     var shankRadius: Float = 0.10 { didSet { geometryNeedsRefresh = true } }
 
     // MARK: - IMU Calibration (Two-Pose, SlimeVR-style left/right split)
@@ -408,10 +397,10 @@ class BodyTrackingModel {
 
     private var lastQuatLogTime: [String: CFTimeInterval] = [:]
     private var lastIMUOrientations: [String: simd_quatf] = [:]
+
     private var calibrationHeadsetYaw: Float = 0.0
     private var calibrationHeadingQ: simd_quatf = simd_quatf(ix: 0, iy: 0, iz: 0, r: 1)
     private var calibrationHeadsetForwardAVP: SIMD3<Float> = SIMD3<Float>(0, 0, -1)
-    private var chestForwardLocalAxis: SIMD3<Float> = SIMD3<Float>(0, 0, -1)
     private var autoCalibrationScheduled: Bool = false
     private let pose1HoldTime: TimeInterval = 3.0
     private let pose2HoldTime: TimeInterval = 5.0
@@ -443,7 +432,7 @@ class BodyTrackingModel {
 
         updateCalibrationStatus(
             title: "Waiting for IMUs",
-            detail: "Connect sensors and hold still. Calibration will auto-start when packets arrive."
+            detail: "Connect sensors. The status panel will confirm quaternion data is arriving — then press Calibrate when you're ready to start the two-pose routine."
         )
 
         handManager.setupPalms(on: contentEntity)
@@ -617,6 +606,54 @@ class BodyTrackingModel {
                 self.handManager.chestYawDeltaInverse = self.chestYawDisplay.inverse
             }
         }
+
+        // If the user closed and reopened the immersive space mid-session,
+        // the RPi may have dropped one or more IMU streams during the gap
+        // (chest is the most-reported casualty). Re-kick every segment so
+        // START actually goes back out — the sendIMUCommand dedupe is
+        // cleared per-node so the resends aren't suppressed. Skipped if
+        // the user is mid-calibration (the calibrate path manages its own
+        // START sequencing).
+        if isCalibrated {
+            kickIMUStreamsAfterReattach()
+        }
+    }
+
+    /// Tears down the scene-bound subscriptions so the next call to
+    /// `attachToSceneIfReady()` re-subscribes against the new scene.
+    /// Without this, closing + reopening the immersive space leaves the
+    /// skeleton update loop and collision haptic events bound to the
+    /// destroyed scene — IMU/UDP keeps flowing (its subscription is on
+    /// imuClient.$orientations, not scene-bound), but the rendered
+    /// skeleton freezes and proximity/contact haptics stop firing.
+    func detachFromScene() {
+        skeletonTrackingSubscription?.cancel()
+        skeletonTrackingSubscription = nil
+        collisionBeganSubscription?.cancel()
+        collisionBeganSubscription = nil
+        collisionEndedSubscription?.cancel()
+        collisionEndedSubscription = nil
+        hasAttachedToScene = false
+    }
+
+    /// Resends START to chest + every active limb after a reopen, clearing
+    /// the per-node dedup so the commands actually leave the socket. The
+    /// RPi treats START as idempotent — extra ones are harmless and they
+    /// recover any stream the bridge dropped while the app was suspended.
+    private func kickIMUStreamsAfterReattach() {
+        if let chestNode = segmentToNodeID[chestSegment] {
+            lastSentCommand.removeValue(forKey: "\(chestNode)_imu")
+            sendIMUCommand(segment: chestSegment, command: "START")
+            imuStreamingSegments.insert(chestSegment)
+        }
+        guard !isIMUOverrideActive else { return }
+        for segment in activeSegments where segment != chestSegment {
+            if let nodeID = segmentToNodeID[segment] {
+                lastSentCommand.removeValue(forKey: "\(nodeID)_imu")
+            }
+            sendIMUCommand(segment: segment, command: "START")
+            imuStreamingSegments.insert(segment)
+        }
     }
 
     // MARK: - IMU Orientation Subscription
@@ -634,6 +671,7 @@ class BodyTrackingModel {
                 }
 
                 // Cache latest raw orientations and run yaw-resync on first packet after restart.
+                let nowTime = CACurrentMediaTime()
                 for (nodeID, quat) in orientations {
                     if let segName = nodeIDToSegment[nodeID] {
                         if let prev = self.lastIMUOrientations[segName] {
@@ -647,24 +685,18 @@ class BodyTrackingModel {
                             self.applyYawResyncIfNeeded(segment: segName, currentRaw: quat)
                         }
                         self.lastIMUOrientations[segName] = quat
+                        self.lastSegmentPacketTime[segName] = nowTime
                     }
                 }
 
-                // Auto-start calibration when first IMU data arrives.
-                if !self.autoCalibrationScheduled && self.calibrationState == .notCalibrated && !orientations.isEmpty {
-                    self.autoCalibrationScheduled = true
-                    print("IMU data received. Starting calibration in 3 seconds...")
-
+                // First-packet status nudge: tell the operator that quaternion
+                // data is flowing and they can press Calibrate. We DO NOT
+                // auto-start the two-pose routine — the user controls when
+                // calibration begins so they can dwell in pose 1.
+                if self.calibrationState == .notCalibrated,
+                   self.calibrationStatusTitle != "IMUs Connected" {
                     self.calibrationStatusTitle = "IMUs Connected"
-                    self.calibrationStatusDetail = "Starting calibration. Prepare pose 1: stand still with arms down."
-                    self.calibrationCountdownSeconds = 3
-
-                    Task { @MainActor in
-                        try? await Task.sleep(nanoseconds: 3_000_000_000)
-                        if self.calibrationState == .notCalibrated {
-                            self.startCalibration()
-                        }
-                    }
+                    self.calibrationStatusDetail = "Quaternion data received. Press Calibrate when you're in pose 1 (standing, arms down, face and chest aligned)."
                 }
 
                 // Dispatch calibrated orientations to active segments.
@@ -750,7 +782,7 @@ class BodyTrackingModel {
 
         updateCalibrationStatus(
             title: "Calibration: Pose 1",
-            detail: "Stand still with both arms hanging down."
+            detail: "Stand still with both arms hanging down. Face and chest must point the same direction (don't twist your torso relative to your head)."
         )
 
         imuClient.sendMessage(to: rpiIP, message: "BEGIN_CALIBRATION")
@@ -869,16 +901,22 @@ class BodyTrackingModel {
             }
         }
 
-        // Chest (single-pose, gravity + headset forward).
+        // Chest (single-pose, gravity + headset-derived forward).
+        // Forward is taken from the AVP headset at pose 1 — the user's torso
+        // and head must point the same way then (see calibration
+        // instructions). Skipping the chest-IMU axis solve removes the
+        // projection-of-torso-pitch-into-apparent-yaw failure mode.
         if let chestPose1 = pose1IMUData[chestSegment] {
             let gravityLocal = detectLimbDownAxis(pose: chestPose1)
-            let forwardLocal = detectChestForwardAxis(pose: chestPose1, headsetForward: calibrationHeadsetForwardAVP, excludeAxis: gravityLocal)
-            chestForwardLocalAxis = forwardLocal
-
             let e_down = simd_normalize(rotateVector(gravityLocal, by: chestPose1))
-            let fwdRaw = rotateVector(forwardLocal, by: chestPose1)
-            let fwdProj = simd_dot(fwdRaw, e_down) * e_down
-            let e_fwd = simd_normalize(fwdRaw - fwdProj)
+
+            let avpFwd = calibrationHeadsetForwardAVP
+            let enuFwd = simd_normalize(SIMD3<Float>(avpFwd.x, -avpFwd.z, 0))
+            // Re-project against measured gravity so e_fwd ⟂ e_down even if
+            // the chest IMU's gravity reading isn't perfectly aligned with
+            // ENU Z.
+            let fwdProj = simd_dot(enuFwd, e_down) * e_down
+            let e_fwd = simd_normalize(enuFwd - fwdProj)
             let e_normal = simd_normalize(simd_cross(e_down, e_fwd))
 
             let M_src = simd_float3x3(columns: (e_normal, e_down, e_fwd))
@@ -966,7 +1004,6 @@ class BodyTrackingModel {
         handManager.chestYawDeltaInverse = simd_quatf(ix: 0, iy: 0, iz: 0, r: 1)
         calibrationHeadingQ = simd_quatf(ix: 0, iy: 0, iz: 0, r: 1)
         handManager.calibrationHeadingQ = simd_quatf(ix: 0, iy: 0, iz: 0, r: 1)
-        chestForwardLocalAxis = SIMD3<Float>(0, 0, -1)
 
         lastSentCommand.removeAll()
 
@@ -991,9 +1028,9 @@ class BodyTrackingModel {
 
         if triggerAutoRecalibration {
             autoCalibrationScheduled = false
-            updateCalibrationStatus(title: "Calibration Reset", detail: "Waiting for IMU data to auto-start calibration.")
+            updateCalibrationStatus(title: "Calibration Reset", detail: "Press Calibrate when ready to begin two-pose calibration.")
         } else {
-            updateCalibrationStatus(title: "Not Calibrated", detail: "Press Re-Calibrate to begin two-pose calibration.")
+            updateCalibrationStatus(title: "Not Calibrated", detail: "Press Calibrate to begin two-pose calibration.")
         }
     }
 
@@ -1150,30 +1187,6 @@ class BodyTrackingModel {
         return simd_quatf(angle: angle, axis: axis)
     }
 
-    private func detectChestForwardAxis(pose: simd_quatf, headsetForward: SIMD3<Float>, excludeAxis: SIMD3<Float>? = nil) -> SIMD3<Float> {
-        let candidateAxes: [SIMD3<Float>] = [
-            SIMD3<Float>( 1, 0, 0), SIMD3<Float>(-1, 0, 0),
-            SIMD3<Float>( 0, 1, 0), SIMD3<Float>( 0,-1, 0),
-            SIMD3<Float>( 0, 0, 1), SIMD3<Float>( 0, 0,-1),
-        ]
-        let enuForward = simd_normalize(SIMD3<Float>(headsetForward.x, -headsetForward.z, 0))
-
-        var bestAxis = SIMD3<Float>(0, 1, 0)
-        var bestDot: Float = -2.0
-        for candidate in candidateAxes {
-            if let exclude = excludeAxis, abs(simd_dot(candidate, exclude)) > 0.9 { continue }
-            let worldDir = rotateVector(candidate, by: pose)
-            let horizontal = SIMD3<Float>(worldDir.x, worldDir.y, 0)
-            guard simd_length(horizontal) > 0.1 else { continue }
-            let d = simd_dot(simd_normalize(horizontal), enuForward)
-            if d > bestDot {
-                bestDot = d
-                bestAxis = candidate
-            }
-        }
-        return bestAxis
-    }
-
     private func detectLimbDownAxis(pose: simd_quatf) -> SIMD3<Float> {
         let candidateAxes: [SIMD3<Float>] = [
             SIMD3<Float>( 1, 0, 0), SIMD3<Float>(-1, 0, 0),
@@ -1315,26 +1328,47 @@ class BodyTrackingModel {
         if obstacle.name.contains("Victory") {
             lastVictoryTime = now
             recordVictory()
-        } else if obstacle.name.hasPrefix("CarCube") {
+        } else if obstacle.name.hasPrefix("Obstacle") {
             lastCollisionTime = now
-            recordCarContact(obstacle.name)
+            recordObstacleContact(obstacle.name)
         } else {
-            // Any other obstacle (e.g. stationary test pillar) still counts
-            // as a generic collision for the banner, but isn't tallied as a car hit.
+            // Any other entity (e.g. stationary debug pillar) still counts
+            // as a generic collision for the banner, but isn't tallied.
             lastCollisionTime = now
         }
     }
 
     private enum TriggerKind { case proximity, body }
 
+    /// Skeleton-cylinder names follow `<skeletonID>_<segment>` (see
+    /// HandTrackingManager.buildArmLimb / buildLegLimb), e.g.
+    /// "center_rightForearm". Used to recognize a cylinder-vs-obstacle
+    /// collision so it gets routed to the body-contact handler.
+    private static let limbCylinderSegmentSuffixes: [String] = [
+        "_leftUpperArm", "_leftForearm", "_rightUpperArm", "_rightForearm",
+        "_leftThigh",    "_leftShank",   "_rightThigh",    "_rightShank"
+    ]
+    private func isLimbCylinder(_ entity: Entity) -> Bool {
+        let n = entity.name
+        for suffix in Self.limbCylinderSegmentSuffixes where n.hasSuffix(suffix) {
+            return true
+        }
+        return false
+    }
+
     /// Classifies a collision pair. Returns the obstacle entity along with
-    /// which of our two headset-anchored triggers it overlapped, or nil if
-    /// neither entity is one of our triggers (e.g. obstacle-vs-obstacle).
+    /// which of our two headset-anchored triggers (or a skeleton cylinder)
+    /// overlapped it. Returns nil if neither entity is one of ours
+    /// (e.g. obstacle-vs-obstacle).
     private func classifyCollision(a: Entity, b: Entity) -> (obstacle: Entity, trigger: TriggerKind)? {
         if a.name == "bodyCollisionTrigger"      { return (b, .body) }
         if b.name == "bodyCollisionTrigger"      { return (a, .body) }
         if a.name == "headsetProximityTrigger"   { return (b, .proximity) }
         if b.name == "headsetProximityTrigger"   { return (a, .proximity) }
+        // Skeleton cylinders count as direct body contact: any limb
+        // touching an obstacle should fire COLLIDED + tally the obstacle.
+        if isLimbCylinder(a)                     { return (b, .body) }
+        if isLimbCylinder(b)                     { return (a, .body) }
         return nil
     }
 
@@ -1351,7 +1385,7 @@ class BodyTrackingModel {
     private func updateMotorsByProximity() {
         guard isIMUCalibrated else { return }
 
-        let midpoints = handManager.limbMidpoints()
+        let midpoints = handManager.limbContactPoints()
 
         // Always-on candidates (eligible IMU limbs). The chest virtual point
         // is held separately so it can be gated per-obstacle by the rear
@@ -1408,18 +1442,13 @@ class BodyTrackingModel {
                              headPosFlat: headPosFlat,
                              backFlat: backFlat)
 
-        // Pass 1: per-obstacle, pick a single candidate using a deadband on
-        // the difference between the closest two candidates. If
-        //     dSecond - dMin < limbSwitchMargin
-        // there is no clear winner, so this obstacle contributes no haptic
-        // for this frame (silence is more honest than chatter near the tie
-        // line). When a winner emerges, the dwell rule prevents flipping
-        // candidates faster than `limbSwitchDwell`.
+        // Pass 1: per-obstacle, every eligible candidate within
+        // `limbSwitchMargin` of the closest candidate's distance gets
+        // assigned the obstacle (and thus fires its motor + lights up its
+        // visualizer in pass 2). This makes near-ties present on both
+        // limbs simultaneously instead of going silent or flipping.
         var limbAssignments: [String: (dist: Float, closest: SIMD3<Float>)] = [:]
-        var seenObstacleNames: Set<String> = []
-        let now = CACurrentMediaTime()
         let margin = max(limbSwitchMargin, 0)
-        let dwell = max(CFTimeInterval(limbSwitchDwell), 0)
 
         // Contact (COLLIDED / VICTORY) is handled event-driven by the
         // shoulder-width body trigger — see `registerBodyContact`. This loop
@@ -1431,14 +1460,11 @@ class BodyTrackingModel {
 
             // Victory entities never buzz; skip them for motor feedback.
             guard !isVictory else { continue }
-            seenObstacleNames.insert(obstacle.name)
 
-            // Per-obstacle candidate set. Start from the always-on shoulders;
-            // include the chest virtual point only when the obstacle's
+            // Per-obstacle candidate set. Start from the always-on shoulders /
+            // legs; include the chest virtual point only when the obstacle's
             // horizontal bearing is inside the rear cone (i.e. it's
-            // genuinely behind the user, not to a side). This prevents a
-            // chest buzz from arriving for an obstacle that the user can't
-            // attribute to "directly behind" — keeping the dodge cue clear.
+            // genuinely behind the user, not to a side).
             var candidatesForThisObstacle = baseCandidates
             if let cc = chestCandidate {
                 let obstacleCenter = obstacle.position(relativeTo: nil)
@@ -1457,79 +1483,27 @@ class BodyTrackingModel {
                 }
             }
 
-            // Score every candidate against this obstacle, then track the
-            // closest two so we can apply the deadband rule.
+            // Score every candidate against this obstacle, then identify
+            // the closest distance. Every candidate within `margin` of that
+            // closest distance is considered tied and gets assigned.
             var perCand: [String: (dist: Float, closest: SIMD3<Float>)] = [:]
-            var bestSeg: String?
             var bestDist: Float = .infinity
-            var secondDist: Float = .infinity
             for cand in candidatesForThisObstacle {
                 let closest = clampPointToAABB(cand.position, boxMin: box.min, boxMax: box.max)
                 let d = simd_length(closest - cand.position)
                 perCand[cand.motorSeg] = (d, closest)
-                if d < bestDist {
-                    secondDist = bestDist
-                    bestDist = d
-                    bestSeg = cand.motorSeg
-                } else if d < secondDist {
-                    secondDist = d
-                }
+                if d < bestDist { bestDist = d }
             }
-            guard let raw = bestSeg else { continue }
+            guard bestDist.isFinite else { continue }
 
-            // Deadband: if the gap between the two closest candidates is
-            // within the margin, we don't have a confident answer. Skip
-            // this obstacle this frame (no haptic). `secondDist` stays
-            // .infinity when only one candidate is in scope, in which case
-            // raw wins outright.
-            let hasClearWinner = (secondDist - bestDist) > margin
-            guard hasClearWinner else {
-                // Don't update lastChosenLimbForObstacle here — we want to
-                // resume from the prior selection if/when the obstacle
-                // re-emerges from the deadband on the same side.
-                continue
+            let tieCutoff = bestDist + margin
+            for (motorSeg, entry) in perCand where entry.dist <= tieCutoff {
+                // Per-limb, hold onto whichever obstacle is closest to it
+                // across the frame (so the motor level reflects the worst
+                // case, and the visualizer's connector points at it).
+                if let existing = limbAssignments[motorSeg], existing.dist <= entry.dist { continue }
+                limbAssignments[motorSeg] = (entry.dist, entry.closest)
             }
-
-            // Dwell: if the prior winner for this obstacle was a *different*
-            // candidate and we're still inside the dwell window, hold the
-            // prior selection. (Same-candidate re-confirmation: no dwell
-            // penalty.)
-            let chosen: String
-            if let prior = lastChosenLimbForObstacle[obstacle.name],
-               prior != raw,
-               let priorEntry = perCand[prior] {
-                let lastSwitch = lastLimbSwitchTime[obstacle.name] ?? -.infinity
-                if (now - lastSwitch) < dwell {
-                    chosen = prior
-                    if let existing = limbAssignments[chosen], existing.dist <= priorEntry.dist {
-                        // already dominated by another obstacle this frame
-                    } else {
-                        limbAssignments[chosen] = (priorEntry.dist, priorEntry.closest)
-                    }
-                    continue
-                } else {
-                    chosen = raw
-                    lastLimbSwitchTime[obstacle.name] = now
-                }
-            } else {
-                if lastChosenLimbForObstacle[obstacle.name] == nil {
-                    lastLimbSwitchTime[obstacle.name] = now
-                }
-                chosen = raw
-            }
-            lastChosenLimbForObstacle[obstacle.name] = chosen
-
-            guard let entry = perCand[chosen] else { continue }
-            // Keep the dominant (closest) obstacle for this candidate across the frame.
-            if let existing = limbAssignments[chosen], existing.dist <= entry.dist { continue }
-            limbAssignments[chosen] = (entry.dist, entry.closest)
-        }
-
-        // Reap selection state for obstacles that have left the proximity
-        // sphere. They'll re-enter (if at all) under a fresh dwell timer.
-        if lastChosenLimbForObstacle.count > seenObstacleNames.count {
-            lastChosenLimbForObstacle = lastChosenLimbForObstacle.filter { seenObstacleNames.contains($0.key) }
-            lastLimbSwitchTime = lastLimbSwitchTime.filter { seenObstacleNames.contains($0.key) }
         }
 
         // Pass 2A: drive every always-on candidate (eligible IMU limbs).

@@ -7,11 +7,36 @@ import ARKit
 import os
 import Combine
 
+// MARK: - Obstacle Types
+
+/// One rectangular-prism obstacle spec. Size is in world meters
+/// (width × height × depth); `yCenter` is the box-center vertical placement.
+/// `xOffsetRange` is the allowable |X| offset from the corridor centerline:
+/// curbs sit closer to center, the others can lean further toward the
+/// corridor wall.
+private struct ObstacleType {
+    let name: String
+    let size: SIMD3<Float>
+    let yCenter: Float
+    let color: UIColor
+    let xOffsetRange: ClosedRange<Float>
+}
+
+/// Pool of obstacle types. All widths are 1.0 m; depths are slim so 6 of
+/// these fit comfortably within the course. The course generator
+/// guarantees at least one instance of each type per run (see
+/// `setupObstacleCourse`).
+private let obstacleTypes: [ObstacleType] = [
+    ObstacleType(name: "Curb",     size: SIMD3<Float>(1.0, 0.10, 0.20), yCenter: 0.05, color: .systemGray,  xOffsetRange: 0.2...0.7),
+    ObstacleType(name: "TrashCan", size: SIMD3<Float>(1.0, 0.60, 0.40), yCenter: 0.30, color: .systemGreen, xOffsetRange: 0.4...1.0),
+    ObstacleType(name: "Signpost", size: SIMD3<Float>(1.0, 0.50, 0.10), yCenter: 1.50, color: .systemBlue,  xOffsetRange: 0.4...1.0),
+    ObstacleType(name: "Wall",     size: SIMD3<Float>(1.0, 2.00, 0.15), yCenter: 1.00, color: .systemRed,   xOffsetRange: 0.4...1.0),
+]
+
 // MARK: - ImmersiveView
 struct ImmersiveView: View {
     @Environment(AppModel.self) var appModel
     @Environment(BodyTrackingModel.self) var bodyModel
-    @Environment(\.openWindow) private var openWindow
 
     
     // anchors & entities
@@ -42,33 +67,33 @@ struct ImmersiveView: View {
     @State private var isWorldTrackingRunning: Bool = false
     @State private var updateTick: Int = 0
 
-    @State private var carEntities: [Entity] = []
-    // Parallel to `carEntities`: the visible toy-car child of each cube, kept
-    // separately so we can scale the visual independently of the cube's hitbox.
-    @State private var toyEntities: [Entity] = []
-    // Native uniform-fit scale for the toy car at hitboxScale=1, computed once
-    // at spawn from `min(hitboxSize / nativeExtents)`. The per-frame timer
-    // applies (visualScale / hitboxScale) on top, then multiplies by this.
-    @State private var baseToyFitScale: Float = 1.0
-    // Cars-from-behind pool. Each slot is either inactive (`carSpawnTimes[i] == nil`)
-    // or carries a launch with a fixed lateral X spawn offset and a heading
-    // bearing θ (radians around Y, 0 = straight -Z). Position evolves as
-    // `spawn + velocity * elapsed`, where velocity rotates -Z by θ. Once
-    // the car has cleared the user, the slot is recycled and (if not
-    // contacted) counted as an avoidance.
-    @State private var carLateralOffsets: [Float] = []
-    @State private var carBearings: [Float] = []
-    @State private var carSpawnTimes: [CFTimeInterval?] = []
-    @State private var carLaunchedCount: Int = 0
-    @State private var nextSpawnAt: CFTimeInterval = 0
+    // Forward obstacle course. Re-built on every Start: the previous run's
+    // entities are detached, then `obstacleCount` rectangular prisms are
+    // randomly placed along -Z at type-specific heights, and a VictoryGoal
+    // slab is positioned at the far end. Each obstacle's name embeds the
+    // current `runIndex` so the per-name dedupe in
+    // `bodyModel.obstaclesHitInstanceIDs` never collides across runs.
+    @State private var obstacleEntities: [Entity] = []
+    @State private var victoryGoalEntity: Entity?
+    @State private var runIndex: Int = 0
     // Last runStartTime we observed; used to detect new-run transitions.
     @State private var observedRunStartTime: CFTimeInterval? = nil
+    // Wall-clock time at which the obstacle course should materialize after
+    // a Start press. nil when no spawn is pending. Lets blindfolded
+    // subjects press Start, close their eyes, then have the course appear
+    // after `bodyModel.courseStartGraceSec`.
+    @State private var pendingSpawnAt: CFTimeInterval?
+
+    // Refs to the immersive-environment entities so the 10Hz timer can
+    // enable/disable them in lockstep with `bodyModel.showVREnvironment`.
+    @State private var skydomeEntity: Entity?
+    @State private var crossTokyoEntity: Entity?
 
     private let logger = Logger(subsystem: "flavinlab.CrossWalk-Tokyo", category: "WorldTracking")
 
     var body: some View {
         ZStack {
-            RealityView { content in
+            RealityView { content, attachments in
                 // Root world anchor
                 let rootAnchor = AnchorEntity(world: matrix_identity_float4x4)
                 content.add(rootAnchor)
@@ -78,6 +103,36 @@ struct ImmersiveView: View {
                 let head = AnchorEntity(.head)
                 content.add(head)
                 self.headAnchor = head
+
+                // World-anchored calibration control panel. Spawned in front
+                // of the user along the +45° elevation line in the y-z plane:
+                // the panel sits `forwardDist` meters ahead and the same
+                // distance above eye level, then tilted +45° about the X
+                // axis so its face is normal to the user's upward gaze.
+                // The panel is well above the 2 m boundary walls, so the
+                // user walks under it during a run — visibility is best
+                // from the start position; after a run, they look back up.
+                // Tunables: forwardDist sets how far ahead/up the panel
+                // sits (preserve the 1:1 ratio to keep the 45° elevation),
+                // eyeHeight matches the wearer's standing eye height in
+                // world coords.
+                if let panelAttachment = attachments.entity(for: "calibrationPanel") {
+                    let forwardDist: Float    = 1.0
+                    let elevationDegrees: Float = 35
+                    let eyeHeight: Float      = 1.6
+                    let elevationRad = elevationDegrees * .pi / 180
+                    // Height above eye derived from (forwardDist, elevation)
+                    // so changing one tunable can't desync them. Tilt about
+                    // X matches elevation so the panel face is normal to the
+                    // user's upward-forward gaze.
+                    let yUpFromEye = forwardDist * tan(elevationRad)
+                    panelAttachment.position = SIMD3<Float>(0,
+                                                            eyeHeight + yUpFromEye,
+                                                            -forwardDist)
+                    panelAttachment.orientation = simd_quatf(angle: elevationRad,
+                                                             axis: SIMD3<Float>(1, 0, 0))
+                    rootAnchor.addChild(panelAttachment)
+                }
 
                 // Head-anchored COLLIDED warning. Hidden by default; toggled on
                 // whenever `bodyModel.lastCollisionTime` is within the display
@@ -196,88 +251,25 @@ struct ImmersiveView: View {
                         )
                         skydome.name = "Skydome"
                         skydome.position = SIMD3<Float>(0, 0, 0)
+                        skydome.isEnabled = bodyModel.showVREnvironment
                         rootAnchor.addChild(skydome)
+                        self.skydomeEntity = skydome
 
                         // Load Tokyo crossing environment (NO collision shapes - visual only).
                         // Yawed -90° around Y so the painted crosswalk runs perpendicular
                         // to the user's default forward facing — the user starts with
                         // their back to the lane direction along which cars approach.
-                        let crossTokyoEntity = try await Entity.load(named: "Crossing_Tokyo")
-                        crossTokyoEntity.orientation = simd_quatf(angle: -.pi / 2, axis: SIMD3<Float>(0, 1, 0))
-                        crossTokyoEntity.position.y = 5.95
-                        rootAnchor.addChild(crossTokyoEntity)
+                        let crossTokyo = try await Entity.load(named: "Crossing_Tokyo")
+                        crossTokyo.orientation = simd_quatf(angle: -.pi / 2, axis: SIMD3<Float>(0, 1, 0))
+                        crossTokyo.position.y = 5.95
+                        crossTokyo.isEnabled = bodyModel.showVREnvironment
+                        rootAnchor.addChild(crossTokyo)
+                        self.crossTokyoEntity = crossTokyo
 
-                        // Cars-from-behind pool. Each car is a *cube* (invisible)
-                        // that owns the collision + physics body, with a ToyCar.usdz
-                        // model parented underneath as the visible mesh. Pool size
-                        // bounds concurrent in-flight cars; the 10Hz timer block
-                        // launches them one at a time at a random bearing from the
-                        // configured set, with a random gap between launches.
-                        let carCount = 6
-                        // Realistic car hitbox in world meters (X = length along
-                        // travel, Y = height, Z = width). The previous 7×1.8×5 m
-                        // box was so wide that the body trigger sphere overlapped
-                        // it from ~3.5 m away regardless of the sphere's radius —
-                        // making `bodyCollisionRadius` effectively irrelevant.
-                        let carHitboxSize = SIMD3<Float>(2.0, 1.5, 1.0)
-                        for i in 0..<carCount {
-                            // Invisible collision body sized to a real car.
-                            let cube = try await Entity.load(named: "Cube")
-                            cube.name = "CarCube_\(i)"
-                            // Keep parent at unit scale so child orientations and
-                            // hitbox dimensions are not stretched non-uniformly.
-                            cube.scale = SIMD3<Float>(repeating: 1)
-                            // Sit at world origin disabled until launched.
-                            cube.position = SIMD3<Float>(0, 0.65, 0)
-                            // Explicit CollisionComponent on the ROOT entity so
-                            // CollisionEvents.{Began,Ended} fire with entityA/B ==
-                            // `cube` itself (name "CarCube_i"). With cube.scale = 1,
-                            // localExtents == world extents.
-                            self.installObstacleCollision(on: cube, localExtents: carHitboxSize)
-                            // Hide the cube via a fully transparent material;
-                            // collision component remains active.
-                            if let modelEntity = cube as? ModelEntity,
-                               var mc = modelEntity.components[ModelComponent.self] as? ModelComponent {
-                                mc.materials = [UnlitMaterial(color: .clear)]
-                                modelEntity.components[ModelComponent.self] = mc
-                            }
-
-                            // Visible toy car — child of the cube so it inherits
-                            // every per-frame position update automatically.
-                            // Uniform fit inside the hitbox; cube parent is now at
-                            // unit scale so no per-axis compensation is needed.
-                            let toy = try await Entity.load(named: "ToyCar")
-                            let nativeExtents = toy.visualBounds(relativeTo: nil).extents
-                            let safeExtents = SIMD3<Float>(
-                                max(nativeExtents.x, 1e-4),
-                                max(nativeExtents.y, 1e-4),
-                                max(nativeExtents.z, 1e-4)
-                            )
-                            let fitWorld = min(
-                                carHitboxSize.x / safeExtents.x,
-                                carHitboxSize.y / safeExtents.y,
-                                carHitboxSize.z / safeExtents.z
-                            )
-                            toy.scale = SIMD3<Float>(repeating: fitWorld)
-                            // Yaw 90° around Y so the model's long axis aligns
-                            // with world X (direction of travel).
-                            toy.orientation = simd_quatf(angle: .pi / 2,
-                                                         axis: SIMD3<Float>(0, 1, 0))
-                            cube.addChild(toy)
-                            self.toyEntities.append(toy)
-                            // All cars share one toy model + hitbox, so the fit
-                            // scale is identical across iterations; latest write wins.
-                            self.baseToyFitScale = fitWorld
-
-                            // Hidden until the user presses Start — the timer
-                            // block enables cars on each new run.
-                            cube.isEnabled = false
-                            rootAnchor.addChild(cube)
-                            self.carEntities.append(cube)
-                            self.carLateralOffsets.append(0)
-                            self.carBearings.append(0)
-                            self.carSpawnTimes.append(nil)
-                        }
+                        // Obstacle course entities are built lazily on each
+                        // Start — `setupObstacleCourse(rootAnchor:)` tears
+                        // down the previous run's obstacles and lays out a
+                        // fresh randomized set.
 
                         // Directional light
                         let lightEntity = Entity()
@@ -292,7 +284,7 @@ struct ImmersiveView: View {
                         print("Error loading entities: \(error)")
                     }
                 }
-            } update: { content in
+            } update: { content, attachments in
                 bodyModel.attachToSceneIfReady()
                 // Reactively toggle head-anchored COLLIDED + VICTORY! texts.
                 // Reading `lastCollisionTime` / `lastVictoryTime` establishes
@@ -320,12 +312,11 @@ struct ImmersiveView: View {
                         if isVictory, bodyModel.lastVictoryTime > lastRenderedVictoryTime {
                             lastRenderedVictoryTime = bodyModel.lastVictoryTime
                             let duration = bodyModel.runDuration ?? 0
-                            let avoided = bodyModel.carsAvoidedCount
-                            let target = bodyModel.carsToWinTotal
-                            let hits = bodyModel.carsHitInstanceIDs.count
+                            let touched = bodyModel.obstaclesHitInstanceIDs.count
+                            let total   = bodyModel.totalObstaclesInCourse
                             let line = String(
-                                format: "Time %.2fs   Avoided %d / %d   Hits %d",
-                                duration, avoided, target, hits
+                                format: "Time %.2fs   Touched %d / %d obstacles",
+                                duration, touched, total
                             )
                             statsText.model?.mesh = MeshResource.generateText(
                                 line,
@@ -340,6 +331,16 @@ struct ImmersiveView: View {
                             statsText.isEnabled = isVictory
                         }
                     }
+                }
+            } attachments: {
+                // SwiftUI panel projected into the immersive scene. Inherits
+                // the surrounding view's environment, but `bodyModel` is
+                // passed explicitly so the @Environment lookup resolves the
+                // same instance the rest of the immersive view uses.
+                Attachment(id: "calibrationPanel") {
+                    CalibrationControlPanel()
+                        .environment(bodyModel)
+                        .frame(width: 720, height: 720)
                 }
             }
             .ignoresSafeArea()
@@ -377,10 +378,9 @@ struct ImmersiveView: View {
                             .foregroundStyle(.white)
                             .monospacedDigit()
                         Text(String(
-                            format: "Avoided %d / %d   Hits %d",
-                            bodyModel.carsAvoidedCount,
-                            bodyModel.carsToWinTotal,
-                            bodyModel.carsHitInstanceIDs.count
+                            format: "Touched %d / %d obstacles",
+                            bodyModel.obstaclesHitInstanceIDs.count,
+                            bodyModel.totalObstaclesInCourse
                         ))
                         .font(.body)
                         .foregroundStyle(.white)
@@ -395,111 +395,55 @@ struct ImmersiveView: View {
             .padding(.top, 18)
         }
         .ignoresSafeArea()
-        // 10Hz timer for car motion and coordinate display
+        // 10Hz timer for run-transition detection and env toggle mirroring.
         .onReceive(Timer.publish(every: 0.1, on: .main, in: .common).autoconnect()) { _ in
-            // Cars-from-behind. Each pool slot carries a fixed lateral X
-            // spawn offset and a fixed bearing θ (radians around Y, 0 =
-            // straight -Z). Spawn at (xOffset, ground, +R); velocity is
-            // -Z rotated by θ around Y, so trajectories combine a lane
-            // displacement and a slight angular drift.
+            // Detect Start (or Restart). Defer the actual obstacle spawn by
+            // `courseStartGraceSec` so the subject has time to close their
+            // eyes; tear down the prior run's obstacles immediately so they
+            // don't linger during the prep window.
             if observedRunStartTime != bodyModel.runStartTime {
                 observedRunStartTime = bodyModel.runStartTime
                 if bodyModel.runStartTime != nil {
-                    // New run began: reset the pool and schedule first spawn.
-                    for car in carEntities { car.isEnabled = false }
-                    for idx in carSpawnTimes.indices { carSpawnTimes[idx] = nil }
-                    for idx in carLateralOffsets.indices { carLateralOffsets[idx] = 0 }
-                    for idx in carBearings.indices { carBearings[idx] = 0 }
-                    carLaunchedCount = 0
-                    nextSpawnAt = CACurrentMediaTime() + 0.5
+                    for e in obstacleEntities { e.removeFromParent() }
+                    obstacleEntities.removeAll()
+                    victoryGoalEntity?.isEnabled = false
+                    let grace = max(0.0, CFTimeInterval(bodyModel.courseStartGraceSec))
+                    pendingSpawnAt = CACurrentMediaTime() + grace
+                } else {
+                    // runStartTime cleared without victory → user pressed
+                    // Stop Run. Cancel any pending spawn, tear down the
+                    // current course, and hide the victory goal so the
+                    // scene returns to its pre-run state.
+                    pendingSpawnAt = nil
+                    for e in obstacleEntities { e.removeFromParent() }
+                    obstacleEntities.removeAll()
+                    victoryGoalEntity?.isEnabled = false
                 }
             }
 
-            if !bodyModel.isRunActive {
-                // Not started yet, or VICTORY reached — clear the pool so
-                // stale cars don't linger or trigger contacts.
-                for i in carEntities.indices {
-                    if carEntities[i].isEnabled { carEntities[i].isEnabled = false }
-                    carSpawnTimes[i] = nil
-                }
-            } else if !carEntities.isEmpty,
-                      carLateralOffsets.count == carEntities.count,
-                      carBearings.count == carEntities.count,
-                      carSpawnTimes.count == carEntities.count {
+            // Course materializes when the prep window elapses. Reset
+            // `runStartTime` at that moment so the on-victory stats and the
+            // head-anchored elapsed timer measure navigation time only,
+            // not navigation + prep.
+            if let due = pendingSpawnAt,
+               CACurrentMediaTime() >= due,
+               let root = rootAnchorRef {
+                runIndex += 1
+                setupObstacleCourse(rootAnchor: root, runIndex: runIndex)
                 let now = CACurrentMediaTime()
-                let speed: Float = max(bodyModel.carSpeed, 0.01)
-                let R: Float = max(bodyModel.carSpawnDistance, 1.0)
-                let totalToWin = bodyModel.carsToWinTotal
-
-                // Spawn launcher.
-                if carLaunchedCount < totalToWin,
-                   now >= nextSpawnAt,
-                   let slot = carSpawnTimes.firstIndex(where: { $0 == nil }) {
-                    let latCap = max(bodyModel.maxLateralOffset, 0)
-                    let bearCapDeg = max(bodyModel.bearingOffsetDegrees, 0)
-                    let bearCapRad = bearCapDeg * .pi / 180
-                    carLateralOffsets[slot] = latCap == 0 ? 0 : Float.random(in: -latCap...latCap)
-                    carBearings[slot] = bearCapRad == 0 ? 0 : Float.random(in: -bearCapRad...bearCapRad)
-                    carSpawnTimes[slot] = now
-                    carLaunchedCount += 1
-                    // Unique per-launch name so BodyTrackingModel's hit set
-                    // dedupes correctly across pool recycling.
-                    carEntities[slot].name = "CarCube_\(slot)_p\(carLaunchedCount)"
-                    carEntities[slot].isEnabled = true
-                    bodyModel.recordCarSpawn()
-                    nextSpawnAt = now + Double.random(in: bodyModel.spawnIntervalRange)
-                }
-
-                // Per-car position update. Velocity = rotateAroundY(-Z, θ),
-                // so vx = sin(θ)*speed (drift), vz = -cos(θ)*speed (forward).
-                let pastOriginThreshold: Float = 4.0
-                let hitboxScale = max(bodyModel.carHitboxScale, 0.01)
-                let visualScale = max(bodyModel.carVisualScale, 0.01)
-                for i in carEntities.indices {
-                    guard let t0 = carSpawnTimes[i] else { continue }
-                    let elapsed = Float(now - t0)
-                    let theta = carBearings[i]
-                    let s = sin(theta), c = cos(theta)
-                    let xPos = carLateralOffsets[i] + speed * s * elapsed
-                    let zPos = R - speed * c * elapsed
-                    carEntities[i].position = SIMD3<Float>(xPos, 0.65, zPos)
-                    // Yaw the cube so its +X (the toy's "front") aligns with
-                    // velocity direction (sin θ, 0, -cos θ). A Y-rotation by
-                    // `yaw` maps (1,0,0) → (cos yaw, 0, -sin yaw); equating
-                    // gives yaw = π/2 - θ. (θ=0 ⇒ yaw=π/2, matches straight-Z.)
-                    let yaw: Float = .pi / 2 - theta
-                    carEntities[i].orientation = simd_quatf(angle: yaw, axis: SIMD3<Float>(0, 1, 0))
-                    carEntities[i].scale = SIMD3<Float>(repeating: hitboxScale)
-                    if i < toyEntities.count {
-                        toyEntities[i].scale = SIMD3<Float>(
-                            repeating: baseToyFitScale * visualScale / hitboxScale
-                        )
-                    }
-
-                    // Recycle once the car is well past the origin (use the
-                    // forward-distance projection so wide bearings still
-                    // recycle on the same threshold).
-                    let forwardDist = R - speed * c * elapsed
-                    if forwardDist < -pastOriginThreshold {
-                        let nameAtPass = carEntities[i].name
-                        carSpawnTimes[i] = nil
-                        carEntities[i].isEnabled = false
-                        if !bodyModel.carsHitInstanceIDs.contains(nameAtPass) {
-                            bodyModel.recordCarAvoided()
-                        }
-                        if bodyModel.carsAvoidedCount >= totalToWin {
-                            bodyModel.recordVictory()
-                        }
-                    }
-                }
+                bodyModel.runStartTime = now
+                observedRunStartTime = now      // suppress re-trigger above
+                pendingSpawnAt = nil
             }
+
+            // Mirror the env toggle so the panel switch applies live without
+            // re-entering the immersive space.
+            let envOn = bodyModel.showVREnvironment
+            if let sky = skydomeEntity, sky.isEnabled != envOn { sky.isEnabled = envOn }
+            if let env = crossTokyoEntity, env.isEnabled != envOn { env.isEnabled = envOn }
 
             updateWorldTrackingAndEntities()
             updateTick &+= 1
-        }
-        .task {
-            // Open calibration panel alongside immersive space
-            openWindow(id: "calibrationPanel")
         }
         .task {
             // Start ARKit session with body tracking providers
@@ -535,6 +479,12 @@ struct ImmersiveView: View {
             headVictoryTextEntity = nil
             headVictoryStatsEntity = nil
             headRunTimerEntity = nil
+            // Drop scene-bound subscriptions BEFORE the scene is destroyed.
+            // The next time the immersive space opens, attachToSceneIfReady
+            // will re-subscribe against the new scene (and re-kick the IMU
+            // streams) — without this, skeleton render and haptics silently
+            // stop working after the user backgrounds + foregrounds the app.
+            bodyModel.detachFromScene()
             #if !targetEnvironment(simulator)
             if !isRunningInPreview {
                 bodyModel.session.stop()
@@ -558,6 +508,140 @@ struct ImmersiveView: View {
         var collision = CollisionComponent(shapes: [shape])
         collision.filter = CollisionFilter(group: .obstacle, mask: .skeleton)
         entity.components.set(collision)
+    }
+
+    // MARK: - Obstacle Course Generation
+
+    /// Tears down the previous run's obstacles + victory goal and lays out
+    /// a fresh randomized course of `bodyModel.obstacleCount` rectangular-
+    /// prism obstacles along -Z, then positions a green VictoryGoal slab
+    /// past the last slot. Each obstacle's name embeds `runIndex` so the
+    /// per-name dedupe set in `bodyModel.obstaclesHitInstanceIDs` never
+    /// collides across runs.
+    private func setupObstacleCourse(rootAnchor: Entity, runIndex: Int) {
+        // 1. Clear previous run.
+        for e in obstacleEntities { e.removeFromParent() }
+        obstacleEntities.removeAll()
+
+        // 2. Read course params off the model. `pathLen` is the user-to-goal
+        //    distance (-Z). Obstacles are placed at fixed `spacing` apart
+        //    starting `prefix` meters in front of the user, and the goal
+        //    is auto-extended past the last slot if `pathLen` is too short.
+        let count    = max(1, bodyModel.obstacleCount)
+        let halfW    = max(0.5, bodyModel.corridorHalfWidth)
+        let userPathLen = max(2.0, bodyModel.coursePathLength)
+        // Random forward buffer so the first obstacle isn't always at the
+        // same Z. Range matches the user's ask of 0.5–1.0 m.
+        let prefix = Float.random(in: 0.5...1.0)
+        let spacing = max(0.3, bodyModel.obstacleMinSpacing)
+        let finalBuffer: Float = 1.0
+        // Last obstacle Z = -prefix - spacing*(count - 1). Goal sits at
+        // least `finalBuffer` past the last obstacle, or further if
+        // `coursePathLength` is set larger.
+        let lastSlotZ = -prefix - spacing * Float(max(0, count - 1))
+        let pathLen   = max(userPathLen, -lastSlotZ + finalBuffer)
+        let zJitterCap = max(0.0, min(0.20, spacing * 0.25))
+
+        // 3. Build the type sequence. Guarantee at least one of each
+        //    obstacle type when `count >= obstacleTypes.count`; fill any
+        //    remaining slots with uniform-random picks; shuffle so the
+        //    guaranteed-type ordering isn't predictable across runs.
+        var typeSequence: [ObstacleType] = []
+        if count >= obstacleTypes.count {
+            typeSequence.append(contentsOf: obstacleTypes)
+            for _ in 0..<(count - obstacleTypes.count) {
+                typeSequence.append(obstacleTypes.randomElement()!)
+            }
+        } else {
+            typeSequence.append(contentsOf: obstacleTypes.shuffled().prefix(count))
+        }
+        typeSequence.shuffle()
+
+        // 4. Lay out one obstacle per Z slot. Slots run from -prefix back
+        //    to -prefix - spacing*(count-1).
+        for i in 0..<count {
+            let zJitter = zJitterCap > 0 ? Float.random(in: -zJitterCap...zJitterCap) : 0
+            let zSlot   = -prefix - spacing * Float(i) + zJitter
+
+            let type = typeSequence[i]
+
+            // X: pick a side, then offset by an amount drawn from this
+            // type's `xOffsetRange` (curbs hug center, the others can lean
+            // toward the corridor wall). Upper bound is clamped so the
+            // obstacle's far edge stays inside the corridor.
+            // Always +X when single-side testing is on, otherwise random.
+            let sideSign: Float = bodyModel.spawnRightSideOnly
+                ? 1.0
+                : (Bool.random() ? 1.0 : -1.0)
+            let halfObstacleW = type.size.x * 0.5
+            let corridorMax   = max(halfObstacleW + 0.05, halfW - halfObstacleW)
+            let lo = max(0.0, type.xOffsetRange.lowerBound)
+            let hi = max(lo + 0.05, min(type.xOffsetRange.upperBound, corridorMax))
+            let xOffsetMag = Float.random(in: lo...hi)
+            let xOffset = sideSign * xOffsetMag
+
+            let mesh = MeshResource.generateBox(size: type.size)
+            let mat  = SimpleMaterial(color: type.color, isMetallic: false)
+            let e    = ModelEntity(mesh: mesh, materials: [mat])
+            e.name = "Obstacle_\(i)_\(type.name)_p\(runIndex)"
+            e.position = SIMD3<Float>(xOffset, type.yCenter, zSlot)
+            e.scale = SIMD3<Float>(repeating: 1)
+            installObstacleCollision(on: e, localExtents: type.size)
+            rootAnchor.addChild(e)
+            obstacleEntities.append(e)
+        }
+
+        // 5. Spawn or re-position the victory goal at exactly `-pathLen`
+        //    (so `coursePathLength` is literally the user-to-goal distance).
+        //    Entity is reused across runs to avoid re-allocating its
+        //    collision shape each time.
+        let goalSize = SIMD3<Float>(2.0, 2.0, 0.10)
+        if victoryGoalEntity == nil {
+            let g = ModelEntity(
+                mesh: .generateBox(size: goalSize),
+                materials: [SimpleMaterial(color: .systemGreen, isMetallic: false)]
+            )
+            g.name = "VictoryGoal"
+            installObstacleCollision(on: g, localExtents: goalSize)
+            rootAnchor.addChild(g)
+            victoryGoalEntity = g
+        }
+        victoryGoalEntity?.position = SIMD3<Float>(0, goalSize.y * 0.5, -pathLen)
+        victoryGoalEntity?.isEnabled = true
+
+        // 6. Publish total so on-victory stats show "touched N / TOTAL".
+        //    Set BEFORE boundary walls are appended so the metric reflects
+        //    only inner dodge-obstacles, not the guidance walls.
+        bodyModel.setObstacleCourseTotal(obstacleEntities.count)
+
+        // 7. Boundary walls running the full length of the corridor at ±halfW.
+        //    Same `.obstacle` collision group as obstacles, so the proximity
+        //    field drives motor haptics as a limb approaches a wall and the
+        //    body trigger fires the COLLIDED banner on direct contact —
+        //    giving subjects a tactile "stay centered" cue. Named
+        //    `BoundaryWall_*` (not `Obstacle_*`) so registerBodyContact in
+        //    BodyTrackingModel hits the generic-collision branch and does
+        //    NOT inflate the touched/total tally.
+        let wallHeight: Float    = 2.0
+        let wallThickness: Float = 0.10
+        let wallLength           = pathLen + 1.0
+        let wallSize             = SIMD3<Float>(wallThickness, wallHeight, wallLength)
+        let wallCenterZ          = -pathLen * 0.5
+        let wallCenterY          = wallHeight * 0.5
+        for sideSign in [Float(-1), Float(1)] {
+            let sideName = sideSign < 0 ? "Left" : "Right"
+            // Inner face flush with ±halfW; wall thickness extends outward.
+            let xCenter = sideSign * (halfW + wallThickness * 0.5)
+            let wall = ModelEntity(
+                mesh: .generateBox(size: wallSize),
+                materials: [SimpleMaterial(color: .systemPurple, isMetallic: false)]
+            )
+            wall.name = "BoundaryWall_\(sideName)_p\(runIndex)"
+            wall.position = SIMD3<Float>(xCenter, wallCenterY, wallCenterZ)
+            installObstacleCollision(on: wall, localExtents: wallSize)
+            rootAnchor.addChild(wall)
+            obstacleEntities.append(wall)
+        }
     }
 
     // MARK: - Head-Anchored Banner Toggles
@@ -591,7 +675,22 @@ struct ImmersiveView: View {
         // progress; hide once VICTORY freezes runEndTime (the final time
         // is reported by `headVictoryStatsEntity`).
         if let timerText = headRunTimerEntity {
-            if bodyModel.isRunActive, let start = bodyModel.runStartTime {
+            // During the pre-spawn grace window the obstacle course hasn't
+            // materialized yet — show a "Get Ready Nn" countdown so a
+            // sighted operator sees the prep clock; the timer flips to
+            // elapsed-time as soon as the course spawns.
+            if let due = pendingSpawnAt {
+                let secsLeft = max(0, Int(ceil(due - now)))
+                timerText.model?.mesh = MeshResource.generateText(
+                    "Get Ready  \(secsLeft)",
+                    extrusionDepth: 0.001,
+                    font: .systemFont(ofSize: 0.04, weight: .bold),
+                    containerFrame: .zero,
+                    alignment: .center,
+                    lineBreakMode: .byTruncatingTail
+                )
+                if !timerText.isEnabled { timerText.isEnabled = true }
+            } else if bodyModel.isRunActive, let start = bodyModel.runStartTime {
                 let elapsed = now - start
                 timerText.model?.mesh = MeshResource.generateText(
                     String(format: "%.2fs", elapsed),

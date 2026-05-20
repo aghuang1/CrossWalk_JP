@@ -38,11 +38,10 @@ struct CrossWalk_TokyoApp: App {
                 .environment(appModel)
         }
 
-        // Calibration control panel (separate window)
-        WindowGroup(id: "calibrationPanel") {
-            CalibrationControlPanel()
-                .environment(bodyModel)
-        }
-        .windowStyle(.plain)
+        // The calibration control panel was previously a separate window
+        // (which spawned in front of the user and had to be moved manually
+        // out of the way of the obstacle course). It now lives inside the
+        // immersive scene as a head-anchored RealityView attachment — see
+        // ImmersiveView.swift for the placement.
     }
 }

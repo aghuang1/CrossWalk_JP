@@ -7,6 +7,7 @@
 */
 
 import SwiftUI
+import QuartzCore
 
 // MARK: - Control Panel Window
 
@@ -21,7 +22,7 @@ struct CalibrationControlPanel: View {
 
                 HStack(alignment: .top, spacing: 24) {
                     ToggleButton(
-                        label: model.isCalibrating ? "Calibrating..." : "Re-Calibrate",
+                        label: model.isCalibrating ? "Calibrating..." : "Calibrate",
                         isActive: !model.isCalibrating,
                         activeColor: .purple,
                         inactiveColor: .gray,
@@ -42,6 +43,37 @@ struct CalibrationControlPanel: View {
                         systemImage: "play.fill"
                     ) {
                         model.startRun()
+                    }
+
+                    // Cancel an in-progress run without recording a victory.
+                    // Only surfaced while `isRunActive` so post-run / pre-run
+                    // states don't show a meaningless Stop button. Tearing
+                    // down the course is handled by ImmersiveView's run-state
+                    // observer reacting to `runStartTime` going nil.
+                    if model.isRunActive {
+                        ToggleButton(
+                            label: "Stop Run",
+                            isActive: true,
+                            activeColor: .red,
+                            inactiveColor: .red,
+                            systemImage: "stop.fill"
+                        ) {
+                            model.stopRun()
+                        }
+                    }
+
+                    // Show/hide the immersive Tokyo environment + skydome.
+                    // Useful while iterating on body tracking / haptics so
+                    // the city geometry doesn't crowd the debug view.
+                    @Bindable var bindable = model
+                    ToggleButton(
+                        label: model.showVREnvironment ? "Env Visible" : "Env Hidden",
+                        isActive: model.showVREnvironment,
+                        activeColor: .green,
+                        inactiveColor: .gray,
+                        systemImage: "mountain.2.fill"
+                    ) {
+                        bindable.showVREnvironment.toggle()
                     }
 
                     Spacer()
@@ -92,6 +124,14 @@ struct CalibrationStatusPanel: View {
                 .foregroundStyle(.white.opacity(0.9))
                 .lineLimit(nil)
 
+            // Live IMU data indicator. Re-evaluates twice per second via
+            // TimelineView so the freshness check (last packet within 1 s)
+            // stays accurate even when no observable state is churning.
+            // Confirms quaternion data is flowing before the operator
+            // presses Calibrate.
+            IMUDataIndicator()
+                .environment(model)
+
             if model.calibrationCountdownSeconds != nil {
                 ProgressView(value: model.calibrationProgressFraction)
                     .progressViewStyle(.linear)
@@ -105,6 +145,39 @@ struct CalibrationStatusPanel: View {
             RoundedRectangle(cornerRadius: 14, style: .continuous)
                 .fill(.black.opacity(0.65))
         )
+    }
+}
+
+// MARK: - IMU Data Indicator
+
+/// Small live readout that confirms quaternion packets are arriving from the
+/// IMUs. Counts segments whose most recent packet is within
+/// `livenessWindow` seconds. The dot is green while at least one segment is
+/// live, red otherwise. Polls twice per second via `TimelineView` so the
+/// stale transition fires on time even if the publisher idles.
+struct IMUDataIndicator: View {
+    @Environment(BodyTrackingModel.self) var model
+
+    private let livenessWindow: CFTimeInterval = 1.0
+
+    var body: some View {
+        TimelineView(.periodic(from: .now, by: 0.5)) { _ in
+            let now = CACurrentMediaTime()
+            let liveCount = model.lastSegmentPacketTime.values.reduce(into: 0) { acc, t in
+                if now - t < livenessWindow { acc += 1 }
+            }
+            let isLive = liveCount > 0
+            HStack(spacing: 8) {
+                Circle()
+                    .fill(isLive ? .green : .red)
+                    .frame(width: 10, height: 10)
+                Text(isLive
+                     ? "Receiving IMU data — \(liveCount) segment\(liveCount == 1 ? "" : "s")"
+                     : "No IMU data")
+                    .font(.system(size: 14, weight: .semibold, design: .monospaced))
+                    .foregroundStyle(.white)
+            }
+        }
     }
 }
 
@@ -185,15 +258,13 @@ struct ControlOverlayPanel: View {
                     StepperRow(label: "Med Max", value: $model.distMedMax, step: 0.05)
                     StepperRow(label: "Far Max", value: $model.distFarMax, step: 0.05)
 
-                    SectionHeader("Haptic Side Stability")
-                    // Deadband: per obstacle, no limb fires unless its
-                    // distance beats the next-closest limb by more than
-                    // this margin. Inside the band, no haptic for that
-                    // obstacle (silence rather than flicker at the tie line).
-                    StepperRow(label: "Side Margin (m)", value: $model.limbSwitchMargin, step: 0.01)
-                    // Dwell: once a side has been selected, lock it for at
-                    // least this long before allowing a switch to the other.
-                    StepperRow(label: "Switch Dwell (s)", value: $model.limbSwitchDwell, step: 0.05)
+                    SectionHeader("Haptic Tie Tolerance")
+                    // Tie cutoff: per obstacle, every eligible limb within
+                    // this many meters of the closest limb's distance fires
+                    // (and gets its visualizer drawn). 0 = strict closest
+                    // wins; ~0.05 m fires both shoulders for a frontal
+                    // wall when both are about equally near.
+                    StepperRow(label: "Tie Margin (m)", value: $model.limbSwitchMargin, step: 0.01)
 
                     SectionHeader("Chest Haptic (Back-Center)")
                     // Toggle the virtual back-centerline candidate that
@@ -228,23 +299,28 @@ struct ControlOverlayPanel: View {
                         }
                     }
 
-                    SectionHeader("Cars")
-                    StepperRow(label: "Speed (m/s)", value: $model.carSpeed, step: 0.5)
-                    StepperRow(label: "Spawn Dist (m)", value: $model.carSpawnDistance, step: 1.0)
-                    // Independent multipliers for the toy-car visual mesh and
-                    // the collision hitbox, so the two can be tuned separately.
-                    StepperRow(label: "Visual Size", value: $model.carVisualScale, step: 0.1)
-                    StepperRow(label: "Hitbox Size", value: $model.carHitboxScale, step: 0.1)
-
-                    SectionHeader("Cars-from-behind Scenario")
-                    // Per-launch random spawn-point offset along ±X (m) AND
-                    // heading deviation around Y (deg). Set either to 0 to
-                    // disable that source of randomness.
-                    StepperRow(label: "Max Lat Offset (m)", value: $model.maxLateralOffset, step: 0.1)
-                    StepperRow(label: "Bearing Offset (°)", value: $model.bearingOffsetDegrees, step: 1.0)
-                    StepperRow(label: "Spawn Min (s)", value: $model.spawnIntervalMin, step: 0.25)
-                    StepperRow(label: "Spawn Max (s)", value: $model.spawnIntervalMax, step: 0.25)
-                    IntStepperRow(label: "Win Count", value: $model.carsToWinTotal, step: 1)
+                    SectionHeader("Obstacle Course")
+                    // Course extends along -Z. Each Start re-randomizes the
+                    // 6 (or `Obstacles`) obstacles drawn from 4 type specs;
+                    // VictoryGoal sits at exactly `-Path Length`.
+                    StepperRow(label: "Path Length (m)",   value: $model.coursePathLength,   step: 1.0)
+                    StepperRow(label: "Corridor Half (m)", value: $model.corridorHalfWidth,  step: 0.25)
+                    IntStepperRow(label: "Obstacles",      value: $model.obstacleCount,      step: 1)
+                    StepperRow(label: "Min Spacing (m)",   value: $model.obstacleMinSpacing, step: 0.25)
+                    // Seconds between Start press and obstacles materializing.
+                    StepperRow(label: "Start Grace (s)",   value: $model.courseStartGraceSec, step: 0.5)
+                    // Right-side-only spawning for single-side testing.
+                    HStack(spacing: 12) {
+                        ToggleButton(
+                            label: model.spawnRightSideOnly ? "Right Side Only" : "Both Sides",
+                            isActive: model.spawnRightSideOnly,
+                            activeColor: .blue,
+                            inactiveColor: .gray,
+                            systemImage: "arrow.right.circle.fill"
+                        ) {
+                            model.spawnRightSideOnly.toggle()
+                        }
+                    }
                 }
             }
             .frame(maxHeight: 500)
